@@ -1,10 +1,12 @@
 # Schematizer — Kafka Repo Analyzer
 
-A Claude Code skill that scans any repository to identify Kafka applications, extract schemas, tag PII fields, and generate Terraform to register schemas to Confluent Schema Registry.
+An AI-powered playbook that scans any repository to identify Kafka applications, extract schemas, tag PII fields, and generate Terraform to register schemas to Confluent Schema Registry.
+
+Works with any AI coding assistant (Claude Code, Cursor, Copilot, Windsurf, etc.) or as a manual checklist for human-driven audits.
 
 ## What It Does
 
-Point this skill at any codebase and it will:
+Point this at any codebase and it will:
 
 1. **Discover** all Kafka producers and consumers across Java, Python, .NET, Go, and Node.js/TypeScript
 2. **Detect risks** — `auto.register.schemas=true`, custom serializers bypassing Schema Registry
@@ -15,9 +17,13 @@ Point this skill at any codebase and it will:
 
 ## How to Use
 
-### 1. Install the skill
+`skill.md` is a structured playbook with detection patterns, classification rules, and output templates. It can be used in multiple ways:
 
-Copy `skill.md` to your Claude Code skills directory:
+---
+
+### Option 1: Claude Code (AI CLI)
+
+Install as a Claude Code skill:
 
 ```bash
 # Global (available in all repos)
@@ -28,33 +34,229 @@ mkdir -p /path/to/your/repo/.claude/skills
 cp skill.md /path/to/your/repo/.claude/skills/kafka-analyzer.md
 ```
 
-### 2. Run it
+Open Claude Code in the target repo and prompt:
 
-Open Claude Code in the target repo and use one of these prompts:
-
-**Full analysis (scan + schemas + Terraform + report):**
 ```
 Analyze this repo for Kafka applications and generate schemas + Terraform
 ```
 
-**Scan only (report without generating files):**
-```
-Scan this repo for Kafka applications and generate a report only, no schemas or Terraform
-```
+Other useful prompts:
 
-**Scope to a specific service:**
 ```
+# Scan only, no file generation
+Scan this repo for Kafka applications and generate a report only
+
+# Scope to one service
 Analyze only the order-service/ directory for Kafka usage
-```
 
-**With MCP server for schema validation:**
-```
+# With schema validation (requires schema-registry MCP server)
 Analyze this repo for Kafka, lint and validate all extracted schemas
 ```
 
-### 3. What happens
+---
 
-Claude Code will:
+### Option 2: Cursor / Windsurf / Copilot
+
+Add `skill.md` to your project context:
+
+**Cursor:**
+- Open the repo in Cursor
+- Add `skill.md` to the chat context (drag it in or use `@skill.md`)
+- Prompt: `Follow the instructions in skill.md to analyze this repo for Kafka applications`
+
+**Windsurf:**
+- Open the repo in Windsurf
+- Reference `skill.md` in the Cascade chat
+- Prompt: `Using skill.md as your guide, scan this repo for Kafka producers and generate schemas + Terraform`
+
+**GitHub Copilot Chat:**
+- Open the repo in VS Code with Copilot
+- Reference `skill.md`: `@workspace #file:skill.md Analyze this repo for Kafka applications following the phases in skill.md`
+
+For all AI assistants, the key is to provide `skill.md` as context and instruct the assistant to follow it phase by phase.
+
+---
+
+### Option 3: ChatGPT / Claude.ai / Any LLM Chat
+
+1. Copy the contents of `skill.md` into the system prompt or as the first message
+2. Upload or paste your source files (build files, producer code, data models, config files)
+3. Prompt: `Follow the phases in the instructions to analyze these files for Kafka usage and generate schemas + Terraform`
+
+This works well for smaller repos. For large repos, focus on specific services:
+- Upload `pom.xml` + producer class + data model + application.properties for one service at a time
+
+---
+
+### Option 4: Manual Audit (Human Checklist)
+
+Use `skill.md` as a step-by-step checklist without any AI:
+
+1. **Phase 1:** Search your repo for the build file patterns and dependency strings listed in section 1.1. Grep for the producer/consumer code patterns in section 1.2.
+2. **Phase 2:** Grep for `auto.register.schemas=true` and custom serializer patterns listed in sections 2.1 and 1.4b.
+3. **Phase 3:** For each producer found, locate the data model class and manually write the schema (JSON Schema, Avro, or Protobuf) using the type mapping tables in section 3.3. Scan field names against the PII patterns in section 3.3b.
+4. **Phase 4:** Classify each producer into Category A/B/C/D/E using the table in section 4.
+5. **Phase 5-6:** Create the schema files and Terraform configs using the templates in sections 5 and 6.
+6. **Phase 7:** Write the report using the template in section 7.
+
+The grep patterns, detection tables, classification rules, and Terraform templates in `skill.md` are all human-readable — no AI required.
+
+---
+
+### Option 5: CI/CD Pipeline (GitHub Actions / GitLab CI / Jenkins)
+
+Run the analyzer automatically on PRs that touch Kafka-related files. This catches schema drift, new producers without SR, and `auto.register.schemas=true` before code merges.
+
+**GitHub Actions with Claude Code:**
+
+```yaml
+# .github/workflows/kafka-schema-check.yml
+name: Kafka Schema Analysis
+
+on:
+  pull_request:
+    paths:
+      - '**/pom.xml'
+      - '**/build.gradle'
+      - '**/package.json'
+      - '**/go.mod'
+      - '**/*.csproj'
+      - '**/requirements.txt'
+      - '**/pyproject.toml'
+      - '**/*Producer*'
+      - '**/*Consumer*'
+      - '**/*Serializer*'
+      - '**/*kafka*'
+      - '**/*.avsc'
+      - '**/*.proto'
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run Kafka Analyzer
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude -p "Follow the skill.md instructions to analyze this repo \
+            for Kafka applications. Generate schema-report.md only, \
+            no schemas or Terraform." \
+            --allowedTools "Glob,Grep,Read,Write" \
+            < skill.md
+
+      - name: Check for risks
+        run: |
+          if grep -q "auto.register.schemas=true" schema-report.md 2>/dev/null; then
+            echo "::warning::auto.register.schemas=true detected"
+          fi
+          if grep -q "Category E" schema-report.md 2>/dev/null; then
+            echo "::warning::Custom serializers without Schema Registry detected"
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-schema-report
+          path: schema-report.md
+```
+
+**GitHub Actions with any LLM API (no Claude Code):**
+
+```yaml
+# Use the grep patterns from skill.md directly — no AI needed for basic checks
+name: Kafka Schema Lint
+
+on:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for auto.register.schemas=true
+        run: |
+          if grep -ri "auto.register.schemas.*true" --include="*.properties" \
+            --include="*.yml" --include="*.yaml" --include="*.java" \
+            --include="*.py" --include="*.cs" --include="*.go" \
+            --include="*.ts" --include="*.js" .; then
+            echo "::error::auto.register.schemas=true found — register schemas via Terraform instead"
+            exit 1
+          fi
+
+      - name: Check for StringSerializer on value
+        run: |
+          if grep -ri "value.serializer.*StringSerializer" --include="*.properties" \
+            --include="*.yml" --include="*.yaml" --include="*.java" .; then
+            echo "::warning::StringSerializer used for values — consider KafkaJsonSchemaSerializer + HeaderSchemaIdSerializer"
+          fi
+
+      - name: Check for custom serializers without SR
+        run: |
+          CUSTOM=$(grep -rli "implements Serializer<\|ISerializer<\|IAsyncSerializer<" \
+            --include="*.java" --include="*.cs" . || true)
+          if [ -n "$CUSTOM" ]; then
+            SR_REF=$(grep -li "schema.registry.url\|SchemaRegistryClient" $CUSTOM || true)
+            if [ -z "$SR_REF" ]; then
+              echo "::warning::Custom serializers found without Schema Registry: $CUSTOM"
+            fi
+          fi
+
+      - name: Check for kafka-python (non-Confluent)
+        run: |
+          if grep -q "kafka-python" **/requirements.txt **/pyproject.toml 2>/dev/null; then
+            echo "::warning::kafka-python detected — consider migrating to confluent-kafka"
+          fi
+```
+
+**GitLab CI:**
+
+```yaml
+# .gitlab-ci.yml
+kafka-schema-check:
+  stage: test
+  rules:
+    - changes:
+        - "**/*kafka*"
+        - "**/*Producer*"
+        - "**/*Serializer*"
+        - "**/pom.xml"
+        - "**/build.gradle"
+        - "**/package.json"
+  script:
+    - |
+      # Basic checks using grep patterns from skill.md
+      echo "=== Checking for auto.register.schemas=true ==="
+      if grep -ri "auto.register.schemas.*true" --include="*.properties" \
+        --include="*.yml" --include="*.yaml" --include="*.java" \
+        --include="*.py" --include="*.cs" .; then
+        echo "RISK: auto.register.schemas=true detected"
+        exit 1
+      fi
+
+      echo "=== Checking for custom serializers without SR ==="
+      grep -rli "implements Serializer<\|ISerializer<" \
+        --include="*.java" --include="*.cs" . || true
+  allow_failure: false
+```
+
+The CI/CD approach works at two levels:
+- **With AI (Claude Code):** Full analysis with schema extraction and report generation
+- **Without AI (grep only):** Lightweight lint checks using the detection patterns from `skill.md` — catches the most common risks with zero AI cost
+
+---
+
+### What Happens During Analysis
+
+Regardless of which tool you use, the analysis follows these phases:
+
 1. Search for build files (`pom.xml`, `package.json`, `go.mod`, `*.csproj`, etc.)
 2. Identify Kafka dependencies and producer/consumer code patterns
 3. Extract topic names from source code
@@ -64,16 +266,9 @@ Claude Code will:
 7. Tag PII fields with `confluent:tags`
 8. Generate schema files, Terraform configs, and a detailed report
 
-### 4. After the analysis
+### Output Structure
 
-1. **Review the report** — `schema-report.md` has the full findings, risks, and recommendations
-2. **Review extracted schemas** — check `schemas/` for accuracy, especially PII tags
-3. **Apply Terraform** — see [Applying the Terraform](#applying-the-terraform) below
-4. **Follow upgrade recommendations** — the report has per-app instructions with code snippets
-
-### 3. Review outputs
-
-The skill creates 3 deliverables in the target repo:
+The analysis produces 3 deliverables:
 
 ```
 your-repo/
@@ -95,6 +290,13 @@ your-repo/
     ├── outputs.tf
     └── import.sh                    # Import script for existing schemas
 ```
+
+### After the Analysis
+
+1. **Review the report** — `schema-report.md` has the full findings, risks, and recommendations
+2. **Review extracted schemas** — check `schemas/` for accuracy, especially PII tags
+3. **Apply Terraform** — see [Applying the Terraform](#applying-the-terraform) below
+4. **Follow upgrade recommendations** — the report has per-app instructions with code snippets
 
 ## What It Detects
 
@@ -140,19 +342,9 @@ These tags must be pre-created in the SR catalog — the Terraform includes `con
 
 ## Prerequisites
 
-### Required
-
-- **Claude Code** — the CLI tool from Anthropic
-
-### Optional (enhances the analysis)
-
-- **schema-registry MCP server** — enables automated schema linting, validation, and inference
-  - `schema_lint` — validates schemas for quality issues (missing defaults, PII, naming)
-  - `schema_validate` — checks backward compatibility against live Schema Registry
-  - `schema_infer` — generates schemas from sample JSON data files
-  - `schema_init` — creates schema project configuration
-
-Without the MCP server, the skill still works — it just performs manual validation and notes in the report which automated checks were skipped.
+- **Any AI coding assistant** (Claude Code, Cursor, Windsurf, Copilot) — or a human following the checklist
+- **Terraform** — to apply the generated configs
+- **Confluent Schema Registry** — target for schema registration
 
 ## Applying the Terraform
 
@@ -200,7 +392,7 @@ The generated `schema-report.md` includes:
 
 ## Upgrade Recommendations
 
-The skill recommends different approaches based on the producer category:
+The analyzer recommends different approaches based on the producer category:
 
 ### Category B — JSON producers without SR
 
@@ -233,13 +425,15 @@ Do NOT replace the custom serializer. Add only `HeaderSchemaIdSerializer` to inj
 
 ## Token Usage Estimates
 
+When using AI assistants, expect roughly:
+
 | Repo Size | Estimated Tokens |
 |-----------|-----------------|
 | Small (1-3 Kafka apps) | 100-150K |
 | Medium (5-10 apps) | 200-400K |
 | Large monorepo (20+ apps) | 500K-1M |
 
-Tips to reduce cost:
-- Use Sonnet instead of Opus (`/model sonnet`)
-- Scope to a specific directory: "Analyze only the `order-service/` directory"
-- Two-pass: "First just scan and report, don't generate Terraform yet"
+Tips to reduce token usage:
+- Use a smaller/faster model (e.g., Sonnet instead of Opus in Claude Code)
+- Scope to a specific directory instead of the whole repo
+- Two-pass: first scan and report, then generate Terraform for selected services
