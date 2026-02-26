@@ -103,11 +103,13 @@ The grep patterns, detection tables, classification rules, and Terraform templat
 
 ---
 
-### Option 5: CI/CD Pipeline (GitHub Actions / GitLab CI / Jenkins)
+### Option 5: CI/CD PR Gate (GitHub Actions / GitLab CI)
 
-Run the analyzer automatically on PRs that touch Kafka-related files. This catches schema drift, new producers without SR, and `auto.register.schemas=true` before code merges.
+Block PRs that introduce Kafka risks. Two approaches — AI-powered (full analysis) or grep-only (zero AI cost).
 
-**GitHub Actions with Claude Code:**
+**Approach A: Full AI analysis as PR gate (GitHub Actions + Claude Code)**
+
+Runs the full skill on every PR that touches Kafka files. Posts the report as a PR comment and fails the check if risks are found.
 
 ```yaml
 # .github/workflows/kafka-schema-check.yml
@@ -118,6 +120,7 @@ on:
     paths:
       - '**/pom.xml'
       - '**/build.gradle'
+      - '**/build.gradle.kts'
       - '**/package.json'
       - '**/go.mod'
       - '**/*.csproj'
@@ -129,10 +132,14 @@ on:
       - '**/*kafka*'
       - '**/*.avsc'
       - '**/*.proto'
+      - '**/application*.properties'
+      - '**/application*.yml'
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -144,19 +151,52 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           claude -p "Follow the skill.md instructions to analyze this repo \
-            for Kafka applications. Generate schema-report.md only, \
-            no schemas or Terraform." \
-            --allowedTools "Glob,Grep,Read,Write" \
-            < skill.md
+            for Kafka applications. Generate only schema-report.md — \
+            no schemas or Terraform files." \
+            --allowedTools "Glob,Grep,Read,Write"
 
-      - name: Check for risks
+      - name: Post report as PR comment
+        if: always() && hashFiles('schema-report.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('schema-report.md', 'utf8');
+            // Truncate if too long for a PR comment
+            const body = report.length > 60000
+              ? report.substring(0, 60000) + '\n\n... (truncated, see full report in artifacts)'
+              : report;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Fail on critical risks
+        if: hashFiles('schema-report.md') != ''
         run: |
-          if grep -q "auto.register.schemas=true" schema-report.md 2>/dev/null; then
-            echo "::warning::auto.register.schemas=true detected"
+          FAILED=0
+
+          if grep -q "auto.register.schemas=true" schema-report.md; then
+            echo "::error::auto.register.schemas=true detected — register schemas via Terraform instead"
+            FAILED=1
           fi
-          if grep -q "Category E" schema-report.md 2>/dev/null; then
-            echo "::warning::Custom serializers without Schema Registry detected"
+
+          if grep -q "Category D" schema-report.md; then
+            echo "::error::Kafka producer with no schema detected — adopt a schema-first approach"
+            FAILED=1
           fi
+
+          if grep -q "Category E" schema-report.md; then
+            echo "::warning::Custom serializers without Schema Registry — add HeaderSchemaIdSerializer"
+          fi
+
+          if grep -q "Category B" schema-report.md; then
+            echo "::warning::JSON producers without Schema Registry — upgrade to KafkaJsonSchemaSerializer + HeaderSchemaIdSerializer"
+          fi
+
+          exit $FAILED
 
       - name: Upload report
         if: always()
@@ -166,10 +206,12 @@ jobs:
           path: schema-report.md
 ```
 
-**GitHub Actions with any LLM API (no Claude Code):**
+**Approach B: Grep-only PR gate (no AI, zero cost)**
+
+Uses the detection patterns from `skill.md` directly as shell grep commands. No AI tokens consumed.
 
 ```yaml
-# Use the grep patterns from skill.md directly — no AI needed for basic checks
+# .github/workflows/kafka-lint.yml
 name: Kafka Schema Lint
 
 on:
@@ -181,46 +223,67 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check for auto.register.schemas=true
+      - name: Block auto.register.schemas=true
         run: |
-          if grep -ri "auto.register.schemas.*true" --include="*.properties" \
-            --include="*.yml" --include="*.yaml" --include="*.java" \
-            --include="*.py" --include="*.cs" --include="*.go" \
-            --include="*.ts" --include="*.js" .; then
-            echo "::error::auto.register.schemas=true found — register schemas via Terraform instead"
+          if grep -ri "auto.register.schemas.*true" \
+            --include="*.properties" --include="*.yml" --include="*.yaml" \
+            --include="*.java" --include="*.py" --include="*.cs" \
+            --include="*.go" --include="*.ts" --include="*.js" .; then
+            echo "::error::auto.register.schemas=true found"
+            echo "Register schemas via Terraform and set auto.register.schemas=false"
             exit 1
           fi
 
-      - name: Check for StringSerializer on value
+      - name: Warn on StringSerializer for values
         run: |
-          if grep -ri "value.serializer.*StringSerializer" --include="*.properties" \
-            --include="*.yml" --include="*.yaml" --include="*.java" .; then
-            echo "::warning::StringSerializer used for values — consider KafkaJsonSchemaSerializer + HeaderSchemaIdSerializer"
+          if grep -ri "value.serializer.*StringSerializer\|value-serializer.*StringSerializer" \
+            --include="*.properties" --include="*.yml" --include="*.yaml" \
+            --include="*.java" .; then
+            echo "::warning::StringSerializer used for values — use KafkaJsonSchemaSerializer + HeaderSchemaIdSerializer"
           fi
 
-      - name: Check for custom serializers without SR
+      - name: Warn on custom serializers without SR
         run: |
           CUSTOM=$(grep -rli "implements Serializer<\|ISerializer<\|IAsyncSerializer<" \
-            --include="*.java" --include="*.cs" . || true)
+            --include="*.java" --include="*.cs" . 2>/dev/null || true)
           if [ -n "$CUSTOM" ]; then
-            SR_REF=$(grep -li "schema.registry.url\|SchemaRegistryClient" $CUSTOM || true)
+            SR_REF=$(grep -li "schema.registry.url\|SchemaRegistryClient" $CUSTOM 2>/dev/null || true)
             if [ -z "$SR_REF" ]; then
-              echo "::warning::Custom serializers found without Schema Registry: $CUSTOM"
+              echo "::warning::Custom serializers without Schema Registry: $CUSTOM"
+              echo "Add HeaderSchemaIdSerializer to inject schema ID into headers"
             fi
           fi
 
-      - name: Check for kafka-python (non-Confluent)
+      - name: Warn on non-Confluent Kafka libraries
         run: |
-          if grep -q "kafka-python" **/requirements.txt **/pyproject.toml 2>/dev/null; then
-            echo "::warning::kafka-python detected — consider migrating to confluent-kafka"
+          if grep -rq "kafka-python" --include="requirements.txt" --include="pyproject.toml" . 2>/dev/null; then
+            echo "::warning::kafka-python detected — migrate to confluent-kafka"
+          fi
+          if grep -rq '"kafkajs"' --include="package.json" . 2>/dev/null; then
+            echo "::warning::kafkajs detected — migrate to @confluentinc/kafka-javascript"
+          fi
+
+      - name: Warn on inline serialization without SR
+        run: |
+          if grep -rn "json\.dumps.*produce\|json\.dumps.*send" \
+            --include="*.py" . 2>/dev/null; then
+            echo "::warning::Inline json.dumps in Kafka produce — use confluent-kafka JSONSerializer"
+          fi
+          if grep -rn "JSON\.stringify.*send\|JSON\.stringify.*produce" \
+            --include="*.ts" --include="*.js" . 2>/dev/null; then
+            echo "::warning::Inline JSON.stringify in Kafka send — use Confluent serializer with SR"
+          fi
+          if grep -rn "json\.Marshal" --include="*.go" . 2>/dev/null | \
+            grep -v "_test.go" | head -5; then
+            echo "::warning::json.Marshal before Kafka Produce — use confluent-kafka-go serializer with SR"
           fi
 ```
 
-**GitLab CI:**
+**GitLab CI equivalent:**
 
 ```yaml
 # .gitlab-ci.yml
-kafka-schema-check:
+kafka-schema-gate:
   stage: test
   rules:
     - changes:
@@ -230,26 +293,57 @@ kafka-schema-check:
         - "**/pom.xml"
         - "**/build.gradle"
         - "**/package.json"
+        - "**/go.mod"
+        - "**/*.csproj"
+        - "**/requirements.txt"
+        - "**/application*.properties"
+        - "**/application*.yml"
   script:
     - |
-      # Basic checks using grep patterns from skill.md
+      FAILED=0
+
       echo "=== Checking for auto.register.schemas=true ==="
       if grep -ri "auto.register.schemas.*true" --include="*.properties" \
         --include="*.yml" --include="*.yaml" --include="*.java" \
-        --include="*.py" --include="*.cs" .; then
-        echo "RISK: auto.register.schemas=true detected"
-        exit 1
+        --include="*.py" --include="*.cs" --include="*.go" .; then
+        echo "BLOCK: auto.register.schemas=true — use Terraform to register schemas"
+        FAILED=1
       fi
 
       echo "=== Checking for custom serializers without SR ==="
-      grep -rli "implements Serializer<\|ISerializer<" \
-        --include="*.java" --include="*.cs" . || true
+      CUSTOM=$(grep -rli "implements Serializer<\|ISerializer<" \
+        --include="*.java" --include="*.cs" . 2>/dev/null || true)
+      if [ -n "$CUSTOM" ]; then
+        SR_REF=$(grep -li "schema.registry.url\|SchemaRegistryClient" $CUSTOM 2>/dev/null || true)
+        if [ -z "$SR_REF" ]; then
+          echo "WARN: Custom serializers without SR: $CUSTOM"
+          echo "Add HeaderSchemaIdSerializer to inject schema ID into headers"
+        fi
+      fi
+
+      echo "=== Checking for non-Confluent libraries ==="
+      grep -rq "kafka-python" --include="requirements.txt" . 2>/dev/null && \
+        echo "WARN: kafka-python detected — migrate to confluent-kafka" || true
+      grep -rq '"kafkajs"' --include="package.json" . 2>/dev/null && \
+        echo "WARN: kafkajs detected — migrate to @confluentinc/kafka-javascript" || true
+
+      exit $FAILED
   allow_failure: false
 ```
 
-The CI/CD approach works at two levels:
-- **With AI (Claude Code):** Full analysis with schema extraction and report generation
-- **Without AI (grep only):** Lightweight lint checks using the detection patterns from `skill.md` — catches the most common risks with zero AI cost
+**What each approach catches:**
+
+| Check | Grep-only | AI-powered |
+|-------|-----------|------------|
+| `auto.register.schemas=true` | Blocks PR | Blocks PR + shows in report |
+| `StringSerializer` for values | Warns | Warns + recommends KafkaJsonSchemaSerializer |
+| Custom serializers without SR | Warns | Warns + recommends HeaderSchemaIdSerializer |
+| Non-Confluent libraries (kafka-python, kafkajs) | Warns | Warns + shows migration path |
+| Inline serialization (json.dumps, JSON.stringify) | Warns | Warns + extracts schema from data model |
+| PII field detection | Not available | Tags fields with confluent:tags |
+| Schema extraction | Not available | Generates schema files |
+| Terraform generation | Not available | Generates confluent_schema resources |
+| Consumer impact analysis | Not available | Cross-references producers and consumers |
 
 ---
 
