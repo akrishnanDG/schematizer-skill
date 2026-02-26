@@ -364,6 +364,201 @@ If no schema files exist, find the data classes/models being serialized and conv
 - io-ts codecs
 - JSON objects passed directly to send
 
+### 3.2b Infer from Inline Key-Value Data (No Class/Model)
+
+If a producer sends data as a raw map, dictionary, or inline JSON object — with no typed class — infer the schema from the code that constructs the data.
+
+**Java — HashMap / Map.of / JSONObject:**
+```
+// Detection patterns (grep)
+new HashMap<>
+Map.of(
+Map.ofEntries(
+new JSONObject(
+put("field_name",
+```
+
+Look for:
+- `Map<String, Object>` or `HashMap<>` populated with `.put("key", value)` near `send()` / `ProducerRecord`
+- `Map.of("key1", val1, "key2", val2)` passed directly to send
+- `new JSONObject().put("key", value)` chains
+- Infer field names from the string keys in `.put()` calls
+- Infer types from the values: string literals → `string`, numeric literals → `number`/`integer`, boolean → `boolean`, variables → trace the variable type
+
+**Python — dict literals / dict construction:**
+```
+# Detection patterns (grep)
+produce.*{
+send.*{
+json.dumps.*{
+dict(
+```
+
+Look for:
+- Dict literals `{"key": value, ...}` passed to `produce()`, `send()`, or `json.dumps()`
+- `dict(key=value, ...)` construction
+- Dicts built incrementally: `data = {}; data["key"] = value`
+- Infer field names from dict keys, types from values
+
+**Go — map[string]interface{} / map[string]any:**
+```
+// Detection patterns (grep)
+map\[string\]interface
+map\[string\]any
+```
+
+Look for:
+- `map[string]interface{}` or `map[string]any` populated with string keys
+- Inline map literals: `map[string]any{"key": value, ...}`
+- Infer field names from keys, types from values
+
+**Node/TS — plain objects:**
+```
+// Detection patterns (grep)
+producer.send.*value:.*{
+send.*{
+```
+
+Look for:
+- Object literals passed directly to `producer.send({ value: { key: val, ... } })`
+- Variables assigned an object literal then passed to send
+- Infer field names from property names, types from values or TypeScript type annotations
+
+**.NET — Dictionary / anonymous objects:**
+```
+// Detection patterns (grep)
+new Dictionary<string
+new {
+anonymous
+```
+
+Look for:
+- `Dictionary<string, object>` with `.Add("key", value)` or initializer syntax
+- Anonymous objects `new { key = value, ... }` serialized and sent
+- Infer field names from keys/properties, types from values
+
+**Other inline data patterns to detect (all languages):**
+
+**JSON string construction (manual JSON building):**
+```
+// Java
+String json = "{\"order_id\":\"" + orderId + "\",\"amount\":" + amount + "}";
+String.format("{\"order_id\":\"%s\",\"amount\":%f}", orderId, amount);
+new StringBuilder().append("{\"order_id\":\"").append(orderId)...
+
+# Python
+f'{{"order_id": "{order_id}", "amount": {amount}}}'
+'{"order_id": "%s"}' % order_id
+"{\"order_id\": \"" + order_id + "\"}"
+
+// Go
+fmt.Sprintf(`{"order_id":"%s","amount":%f}`, orderID, amount)
+
+// Node/TS
+`{"order_id": "${orderId}", "amount": ${amount}}`
+```
+
+Infer field names from the JSON keys in the string. Infer types from the interpolated variables.
+
+**JSON tree / node APIs (building JSON without a class):**
+```
+// Java — Jackson JsonNode / ObjectNode
+ObjectNode node = mapper.createObjectNode();
+node.put("order_id", orderId);
+node.put("amount", amount);
+
+// Java — Gson JsonObject
+JsonObject obj = new JsonObject();
+obj.addProperty("order_id", orderId);
+
+// .NET — JObject (Newtonsoft) / JsonNode (System.Text.Json)
+var obj = new JObject { ["order_id"] = orderId, ["amount"] = amount };
+var node = new JsonObject { ["order_id"] = orderId };
+
+// Go — map or gjson
+data := map[string]interface{}{"order_id": id, "amount": amt}
+```
+
+Infer fields from `.put()`, `.addProperty()`, or property assignments.
+
+**Builder / fluent patterns:**
+```
+// Java
+Event.builder().orderId(id).amount(amt).build();
+new EventBuilder().setOrderId(id).setAmount(amt).build();
+
+// Kotlin
+Event(orderId = id, amount = amt)
+
+// Scala
+Event(orderId = id, amount = amt)
+case class Event(orderId: String, amount: Double)
+```
+
+Trace the builder class to find all setter methods — each setter corresponds to a field.
+
+**Database row / ORM object forwarding:**
+```
+// Java — JPA/Hibernate entity sent to Kafka
+kafkaTemplate.send("topic", entity.getId(), objectMapper.writeValueAsString(entity));
+
+# Python — SQLAlchemy / Django model
+producer.produce("topic", json.dumps(model.__dict__))
+producer.produce("topic", json.dumps(model_to_dict(instance)))
+
+// Go — GORM / sqlx struct
+json.Marshal(dbRow)
+
+// Node — Sequelize / Prisma
+producer.send({ value: JSON.stringify(dbRecord) })
+```
+
+Look for the ORM model / entity class definition — it IS the schema. Extract fields from the entity annotations (`@Column`, `@Field`, model fields).
+
+**Protobuf builders without SR:**
+```
+// Java
+MyEvent.newBuilder().setOrderId(id).setAmount(amt).build();
+producer.send(new ProducerRecord<>("topic", event.toByteArray()));
+
+# Python
+event = MyEvent()
+event.order_id = id
+producer.produce("topic", event.SerializeToString())
+
+// Go
+event := &pb.MyEvent{OrderId: id, Amount: amt}
+data, _ := proto.Marshal(event)
+```
+
+The `.proto` file IS the schema — find it via the generated class import path. This is Category E (custom Protobuf serialization without SR).
+
+**CSV / delimited strings:**
+```
+// Java
+String csv = orderId + "," + amount + "," + email;
+producer.send(new ProducerRecord<>("topic", csv));
+
+# Python
+producer.produce("topic", f"{order_id},{amount},{email}".encode())
+```
+
+Look for string joining with delimiters (`,`, `|`, `\t`) near `send()`/`produce()`. Field names are not in the data — check for comments, header rows, or variable names to infer them. This is **Category D** if field names cannot be determined.
+
+**How to build the schema from any of these patterns:**
+1. Collect all field names from keys, setters, properties, or interpolated variable names
+2. For each field, determine the value type:
+   - String literal or `String` variable → `"type": "string"`
+   - Integer literal or `int`/`long` variable → `"type": "integer"`
+   - Float/double literal → `"type": "number"`
+   - Boolean → `"type": "boolean"`
+   - Nested map/dict/object → `"type": "object"` with nested properties
+   - List/array → `"type": "array"`
+   - If type is ambiguous (e.g., `Object`, `interface{}`, `any`), default to `"type": "string"` and add a TODO comment
+3. Mark fields as `required` if they are always set (not conditionally)
+4. Tag PII fields using the patterns in section 3.3b
+5. Classify as **Category B** if schema can be inferred, **Category D** if field names cannot be determined (e.g., raw CSV with no header)
+
 ### 3.3 Convert Data Models to Schemas
 
 For each data model found, generate a schema file. **Tag potential PII fields** with `confluent:tags` (see 3.3b).
