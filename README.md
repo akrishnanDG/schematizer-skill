@@ -486,36 +486,50 @@ The generated `schema-report.md` includes:
 
 ## Upgrade Recommendations
 
-The analyzer recommends different approaches based on the producer category:
+> **Important:** `HeaderSchemaIdSerializer` is **Java-only**. Non-Java languages do not have
+> an equivalent — the Confluent serializer always embeds the schema ID in the payload (5-byte
+> prefix), which is a breaking change for consumers parsing raw data.
 
 ### Category B — JSON producers without SR
 
-Replace the serializer entirely. Payload stays clean JSON, consumers don't break.
+**Java (non-breaking):** Replace serializer with `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer`. Payload stays clean JSON.
 
 | Current State | Recommended |
 |--------------|-------------|
-| `StringSerializer` + JSON | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` |
-| Spring `JsonSerializer` | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` |
-| `kafka-python` + `json.dumps` | `confluent-kafka` `JSONSerializer` + `HeaderSchemaIdSerializer` |
-| `kafkajs` + `JSON.stringify` | `@confluentinc/kafka-javascript` with SR schema support |
-| Go `json.Marshal` | `confluent-kafka-go` JSON serializer + header mode |
-| .NET `JsonConvert` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` + header mode |
+| Java `StringSerializer` + JSON | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` |
+| Java `JsonSerializer` (Spring) | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` |
+
+**Python, Go, .NET, Node.js (breaking change OR governance only):**
+
+| Current State | Option A: Governance only | Option B: Full SR (breaking) |
+|--------------|--------------------------|------------------------------|
+| `kafka-python` / `json.dumps` | Keep serializer, register schema in SR via TF | `confluent-kafka` `JSONSerializer` — payload gets prefix, update consumers |
+| `kafkajs` / `JSON.stringify` | Keep serializer, register schema in SR via TF | `@confluentinc/kafka-javascript` with SR — update consumers |
+| Go `json.Marshal` | Keep serializer, register schema in SR via TF | `confluent-kafka-go` JSON serializer — payload gets prefix, update consumers |
+| .NET `JsonConvert` | Keep serializer, register schema in SR via TF | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` — update consumers |
+
+Option A registers the schema in SR for governance (compatibility checks, PII tags) without changing the producer or breaking consumers. Option B gives full SR integration but requires coordinated migration.
 
 ### Category E — Custom serializers (any format)
 
-Do NOT replace the custom serializer. Add only `HeaderSchemaIdSerializer` to inject the schema ID into Kafka headers. The custom serializer keeps producing the exact same payload bytes. Consumers don't break.
+Do NOT replace the custom serializer.
+
+**Java (non-breaking):** Add `HeaderSchemaIdSerializer` to inject schema ID into headers. Custom serializer keeps producing the same bytes.
 
 | Current State | Recommended |
 |--------------|-------------|
 | Custom `Serializer<T>` (JSON, Avro, or Protobuf) | Keep custom serializer + add `HeaderSchemaIdSerializer` |
-| Inline `fastavro` / `DatumWriter` (Avro) | Keep custom serializer + add `HeaderSchemaIdSerializer` |
-| Inline `proto.Marshal` / `toByteArray()` (Protobuf) | Keep custom serializer + add `HeaderSchemaIdSerializer` |
 
-**Why this distinction?**
+**Python, Go, .NET (governance only OR breaking change):**
 
-- **Category B (JSON):** The data is JSON. `KafkaJsonSchemaSerializer` produces the same clean JSON output, so swapping the serializer is safe. `HeaderSchemaIdSerializer` puts the schema ID in headers instead of the payload.
+| Current State | Option A: Governance only | Option B: Full SR (breaking) |
+|--------------|--------------------------|------------------------------|
+| Custom serializer (any format) | Keep serializer, register schema in SR via TF | Replace with Confluent serializer — payload changes, update consumers |
 
-- **Category E (Custom):** Replacing a custom serializer with a Confluent serializer (e.g., `KafkaAvroSerializer`) changes the payload encoding or wire format — this breaks existing consumers. Adding only `HeaderSchemaIdSerializer` keeps the payload byte-identical while adding SR governance via headers.
+> **Why is Java different?** Java has `HeaderSchemaIdSerializer` which puts the schema ID
+> in Kafka headers instead of the payload. This keeps the payload byte-identical, so
+> consumers don't break. Python, Go, .NET, and Node.js don't have this option — their
+> Confluent serializers always embed the schema ID in the payload, which is a breaking change.
 
 ## Token Usage Estimates
 
