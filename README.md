@@ -416,6 +416,17 @@ Each producer is classified into a category that drives the recommended action:
 | **D: No schema** | Raw strings/bytes, no data model | Flagged in report |
 | **E: Custom serializer** | Custom `Serializer<T>` impl, inline `json.dumps`, `json.Marshal`, `fastavro`, `proto.Marshal`, etc. | Schema extracted + recommend adding `HeaderSchemaIdSerializer` (keep custom serializer) |
 
+### Multi-Schema Topic Detection
+
+When multiple services produce **different event types to the same topic** (e.g., `InvoiceEvent` and `RefundEvent` both going to `financial-events`), the skill:
+
+1. Detects the collision by grouping producers by topic
+2. Registers each event type as its own subject (`invoice-event`, `refund-event`)
+3. Generates a **wrapper schema** with `oneOf` (JSON Schema), union (Avro), or `oneof` (Protobuf)
+4. Registers the wrapper as the topic subject (`financial-events-value`) with `schema_reference` blocks
+
+This uses `TopicNameStrategy` (the default) — no need to change subject naming strategies.
+
 ### PII Detection
 
 Field names are scanned against known PII patterns and tagged with `confluent:tags`:
