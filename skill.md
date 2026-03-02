@@ -1115,19 +1115,27 @@ format or wire encoding, which **breaks all existing consumers**.
 
    **.NET (Confluent.Kafka >= 2.10.1):**
    ```csharp
-   // Set schema ID strategy to header mode in serializer config:
-   // json.serializer.schema.id.strategy = SchemaIdSerializerStrategy.Header
+   // In serializer config, set SchemaIdStrategy to Header:
+   var config = new JsonSerializerConfig
+   {
+       SchemaIdStrategy = SchemaIdSerializerStrategy.Header
+   };
    ```
 
    **Go (confluent-kafka-go >= 2.10.1):**
    ```go
-   // Use HeaderSchemaIDSerializer instead of PrefixSchemaIDSerializer:
    import "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
-   // Pass serde.HeaderSchemaIDSerializer as the schema ID serializer
+   // Pass serde.HeaderSchemaIDSerializer as the schema ID serializer function
+   // Header keys: serde.KeySchemaIDHeader ("__key_schema_id")
+   //              serde.ValueSchemaIDHeader ("__value_schema_id")
    ```
 
    **Node.js (@confluentinc/kafka-javascript >= 1.3.2):**
-   Configure schema ID in header mode in the serializer config.
+   ```typescript
+   import { HeaderSchemaIdSerializer } from '@confluentinc/kafka-javascript/schemaregistry/serde';
+   // Pass HeaderSchemaIdSerializer via schemaIdSerializer in SerializerConfig
+   // Header keys: __key_schema_id, __value_schema_id
+   ```
 
 4. Schema governance is in place: schema in SR, schema ID in headers, compatibility checks enforced.
 
@@ -1195,9 +1203,9 @@ to inject the schema ID into Kafka headers. The payload stays byte-identical.
 |----------|--------------|---------------|--------|
 | Java | Custom `Serializer<T>` (any format) | Keep serializer + add `HeaderSchemaIdSerializer` | `value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer` |
 | Python (>= 2.10.1) | Custom serializer / `fastavro` / `proto` | Keep serializer + add `header_schema_id_serializer` | `conf={'schema.id.serializer': header_schema_id_serializer}` |
-| .NET (>= 2.10.1) | Custom `ISerializer<T>` (any format) | Keep serializer + set schema ID strategy to header | `json.serializer.schema.id.strategy = SchemaIdSerializerStrategy.Header` |
-| Go (>= 2.10.1) | Custom serializer / `goavro` / `proto.Marshal` | Keep serializer + use `HeaderSchemaIDSerializer` | `serde.HeaderSchemaIDSerializer` as schema ID serializer |
-| Node.js (>= 1.3.2) | Custom serializer | Keep serializer + configure header-based schema ID | Schema ID in header config |
+| .NET (>= 2.10.1) | Custom `ISerializer<T>` (any format) | Keep serializer + set `SchemaIdStrategy = SchemaIdSerializerStrategy.Header` | `SchemaIdStrategy = SchemaIdSerializerStrategy.Header` in serializer config |
+| Go (>= 2.10.1) | Custom serializer / `goavro` / `proto.Marshal` | Keep serializer + use `serde.HeaderSchemaIDSerializer` | Pass `serde.HeaderSchemaIDSerializer` as schema ID serializer function |
+| Node.js (>= 1.3.2) | Custom serializer | Keep serializer + use `HeaderSchemaIdSerializer` | Pass `HeaderSchemaIdSerializer` via `schemaIdSerializer` in `SerializerConfig` |
 
 Payload stays byte-identical across all languages. Schema ID goes to Kafka headers.
 **Non-breaking** for all existing consumers.
