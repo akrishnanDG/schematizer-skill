@@ -1097,24 +1097,31 @@ format or wire encoding, which **breaks all existing consumers**.
 1. Register the schema in Schema Registry via Terraform (already generated in `terraform/schemas.tf`)
 2. Keep the existing custom serializer — the payload does not change
 
-**For Java producers:**
-3. Add `HeaderSchemaIdSerializer` to inject the schema ID into Kafka **headers**:
+3. Configure the schema ID to be written to Kafka **headers** instead of the payload prefix.
+   The payload stays byte-identical. **Existing consumers will not break.**
+
+   **Java:**
    ```properties
    value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
    ```
-4. The payload stays byte-identical. Existing consumers will not break.
-5. Schema governance is in place: schema in SR, schema ID in headers, compatibility checks enforced.
 
-**For Python, Go, .NET, Node.js producers:**
-3. `HeaderSchemaIdSerializer` is **not available** outside Java.
-4. Register the schema in SR via Terraform for governance (compatibility checks, PII tagging).
-5. The schema ID will NOT be embedded in messages. Governance is enforced at the SR level only.
-6. To add schema ID to messages, either:
-   - **Option A:** Migrate to the Confluent serializer (e.g., `AvroSerializer`, `JSONSerializer`).
-     This is a **breaking change** — the payload gets a 5-byte Confluent wire format prefix.
-     All consumers must be updated simultaneously to use the matching Confluent deserializer.
-   - **Option B:** Add schema ID to Kafka headers manually in application code (custom interceptor
-     or producer callback). This is non-breaking but requires custom implementation.
+   **Python (confluent-kafka >= 2.10.1):**
+   ```python
+   from confluent_kafka.schema_registry import header_schema_id_serializer
+   # Pass schema.id.serializer=header_schema_id_serializer to the serializer config
+   ```
+
+   **.NET (Confluent.Kafka >= 2.10.1):**
+   Configure the serializer to use header-based schema ID placement.
+
+   **Go (confluent-kafka-go >= 2.10.1):**
+   Configure the serializer to use header-based schema ID placement.
+
+4. Schema governance is in place: schema in SR, schema ID in headers, compatibility checks enforced.
+
+> **Minimum versions required:** Schema ID in headers is supported in all Confluent clients
+> since v2.10.1 (Java has had it longer via `HeaderSchemaIdSerializer`). Ensure your
+> Confluent client library is at least v2.10.1.
 
 See per-app upgrade instructions in the "Producer Upgrade Recommendations" section below.
 
@@ -1146,100 +1153,38 @@ For producers with schemas in code but no Schema Registry integration (Category 
 
 ### Upgrade Quick Reference — JSON Data (Category B)
 
-> **Important:** `HeaderSchemaIdSerializer` is **Java-only**. For non-Java languages,
-> the Confluent serializer embeds the schema ID in the payload (5-byte prefix), which
-> is a breaking change for consumers parsing raw JSON. See language-specific notes below.
+Replace the serializer with the Confluent JSON serializer + header-based schema ID.
+Payload stays clean JSON. Schema ID goes to Kafka headers. **Non-breaking** for consumers.
 
-**Java:**
+> **Minimum version:** Schema ID in headers requires Confluent client >= 2.10.1
+> (Java has supported it longer via `HeaderSchemaIdSerializer`).
 
 | Current State | Recommended Serializer | Config Changes |
 |--------------|----------------------|----------------|
-| `StringSerializer` + JSON | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add `value.serializer`, `schema.registry.url`, `value.schema.id.serializer` |
-| `JsonSerializer` (Spring) | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add Confluent dependency, update serializer class |
-
-Payload stays clean JSON. Schema ID goes to headers. **Non-breaking** for consumers.
-
-**Python (breaking change):**
-
-| Current State | Recommended Serializer | Notes |
-|--------------|----------------------|-------|
-| `kafka-python` + `json.dumps` | `confluent-kafka` `JSONSerializer` | Replace library, use `SerializingProducer`. **Payload gets 5-byte prefix.** |
-| `confluent-kafka` + inline `json.dumps` | `confluent-kafka` `JSONSerializer` | Remove inline serialization. **Payload gets 5-byte prefix.** |
-
-No `HeaderSchemaIdSerializer` available. Consumers must switch to `JSONDeserializer` simultaneously.
-Alternative: keep `json.dumps`, register schema in SR via Terraform for governance only (no schema ID in messages).
-
-**.NET (breaking change):**
-
-| Current State | Recommended Serializer | Notes |
-|--------------|----------------------|-------|
-| `JsonConvert` / `System.Text.Json` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` | **Payload gets 5-byte prefix.** Consumers must update. |
-
-No header-based schema ID option. Alternative: keep current serializer, register schema in SR for governance only.
-
-**Go (breaking change):**
-
-| Current State | Recommended Serializer | Notes |
-|--------------|----------------------|-------|
-| `json.Marshal` before `Produce()` | `confluent-kafka-go` JSON serializer with SR | **Payload gets 5-byte prefix.** Consumers must update. |
-
-No header-based schema ID option. Alternative: keep `json.Marshal`, register schema in SR for governance only.
-
-**Node.js/TypeScript (breaking change):**
-
-| Current State | Recommended Serializer | Notes |
-|--------------|----------------------|-------|
-| `kafkajs` + `JSON.stringify` | `@confluentinc/kafka-javascript` with SR | **Payload format may change.** Consumers must update. |
-
-No header-based schema ID option. Alternative: keep `JSON.stringify`, register schema in SR for governance only.
+| Java `StringSerializer` + JSON | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add `value.serializer`, `schema.registry.url`, `value.schema.id.serializer` |
+| Java `JsonSerializer` (Spring) | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add Confluent dependency, update serializer class |
+| Python `kafka-python` + `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Replace library, use `SerializingProducer`, set `schema.id.serializer` |
+| Python `confluent-kafka` + inline `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Remove inline serialization, set `schema.id.serializer` |
+| .NET `JsonConvert` / `System.Text.Json` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` + header mode | Add NuGet (>= 2.10.1), configure header-based schema ID |
+| Go `json.Marshal` before `Produce()` | `confluent-kafka-go` JSON serializer + header mode | Remove manual marshal, add SR client, configure header-based schema ID |
+| Node `kafkajs` + `JSON.stringify` | `@confluentinc/kafka-javascript` with SR + header mode | Replace library, remove inline serialization, configure header-based schema ID |
 
 ### Upgrade Quick Reference — Custom Serializers (Category E)
 
-Do NOT replace the custom serializer. Register the schema in SR via Terraform for
-governance. For Java, add `HeaderSchemaIdSerializer` to inject schema ID into headers.
+Do NOT replace the custom serializer. Keep it as-is and add header-based schema ID
+to inject the schema ID into Kafka headers. The payload stays byte-identical.
 
-> **Important:** `HeaderSchemaIdSerializer` is **Java-only**. For non-Java custom
-> serializers, register the schema in SR for governance (compatibility checks, PII
-> tagging) but note that the schema ID will not be embedded in messages.
+> **Minimum version:** Schema ID in headers requires Confluent client >= 2.10.1.
 
-**Java custom serializers (non-breaking with HeaderSchemaIdSerializer):**
+| Language | Current State | Recommendation | Config |
+|----------|--------------|---------------|--------|
+| Java | Custom `Serializer<T>` (any format) | Keep serializer + add `HeaderSchemaIdSerializer` | `value.schema.id.serializer=HeaderSchemaIdSerializer` |
+| Python | Custom serializer / `fastavro` / `proto` | Keep serializer + add `header_schema_id_serializer` | `schema.id.serializer=header_schema_id_serializer` |
+| .NET | Custom `ISerializer<T>` (any format) | Keep serializer + configure header-based schema ID | Confluent.Kafka >= 2.10.1, header mode config |
+| Go | Custom serializer / `goavro` / `proto.Marshal` | Keep serializer + configure header-based schema ID | confluent-kafka-go >= 2.10.1, header mode config |
 
-| Current State | Recommendation | Config Changes |
-|--------------|---------------|----------------|
-| Custom `Serializer<T>` with `GenericDatumWriter` (Avro) | Keep custom serializer + add `HeaderSchemaIdSerializer` | Add `schema.registry.url`, `value.schema.id.serializer=HeaderSchemaIdSerializer` |
-| Custom `Serializer<T>` with `com.google.protobuf` (Protobuf) | Keep custom serializer + add `HeaderSchemaIdSerializer` | Add `schema.registry.url`, `value.schema.id.serializer=HeaderSchemaIdSerializer` |
-| Custom `Serializer<T>` with Jackson/Gson (JSON) | Keep custom serializer + add `HeaderSchemaIdSerializer` | Add `schema.registry.url`, `value.schema.id.serializer=HeaderSchemaIdSerializer` |
-
-Payload stays byte-identical. Schema ID goes to Kafka headers. **Non-breaking.**
-
-**Python custom serializers (governance only OR breaking change):**
-
-| Current State | Option A: Governance only (non-breaking) | Option B: Full SR integration (breaking) |
-|--------------|----------------------------------------|----------------------------------------|
-| `fastavro` / `DatumWriter` (Avro) | Keep serializer, register schema in SR via TF | Switch to `confluent-kafka` `AvroSerializer`. **Payload gets prefix.** Update consumers. |
-| `protobuf` / `SerializeToString()` | Keep serializer, register schema in SR via TF | Switch to `confluent-kafka` `ProtobufSerializer`. **Payload gets prefix.** Update consumers. |
-| Custom `json.dumps` function | Keep serializer, register schema in SR via TF | Switch to `confluent-kafka` `JSONSerializer`. **Payload gets prefix.** Update consumers. |
-
-**.NET custom serializers (governance only OR breaking change):**
-
-| Current State | Option A: Governance only (non-breaking) | Option B: Full SR integration (breaking) |
-|--------------|----------------------------------------|----------------------------------------|
-| Custom `ISerializer<T>` with `Apache.Avro` | Keep serializer, register schema in SR via TF | Switch to `Confluent.SchemaRegistry.Serdes.Avro.AvroSerializer<T>`. **Breaking.** |
-| Custom `ISerializer<T>` with `Google.Protobuf` | Keep serializer, register schema in SR via TF | Switch to `Confluent.SchemaRegistry.Serdes.Protobuf.ProtobufSerializer<T>`. **Breaking.** |
-| Custom `ISerializer<T>` with JSON | Keep serializer, register schema in SR via TF | Switch to `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>`. **Breaking.** |
-
-**Go custom serializers (governance only OR breaking change):**
-
-| Current State | Option A: Governance only (non-breaking) | Option B: Full SR integration (breaking) |
-|--------------|----------------------------------------|----------------------------------------|
-| `goavro` / manual Avro | Keep serializer, register schema in SR via TF | Switch to `confluent-kafka-go` Avro serializer. **Breaking.** |
-| `proto.Marshal` | Keep serializer, register schema in SR via TF | Switch to `confluent-kafka-go` Protobuf serializer. **Breaking.** |
-
-> **Why two options for non-Java?** `HeaderSchemaIdSerializer` is Java-only. Non-Java
-> producers can't inject the schema ID into headers without custom code. Option A gives
-> you schema governance in SR (compatibility checks, PII tags, Terraform management)
-> without changing the producer at all. Option B gives full SR integration but requires
-> coordinated producer + consumer migration.
+Payload stays byte-identical across all languages. Schema ID goes to Kafka headers.
+**Non-breaking** for all existing consumers.
 
 ---
 
