@@ -248,6 +248,119 @@ For each Kafka application found:
   - category: A | B | C | D | E (see Phase 4)
 ```
 
+### 1.6 Detect Multi-Schema Topics
+
+After building the app catalog, check if **multiple data models produce to the same topic**.
+This happens when different services (or different code paths in the same service) send
+different event types to a single topic.
+
+**How to detect:**
+1. Group all producers by topic name from the catalog
+2. For each topic, check if there are multiple producers with **different** data models
+3. Same data model to same topic = normal (just dedup the schema)
+4. Different data models to same topic = **multi-schema topic** — requires special handling
+
+**What to look for:**
+- Two producers with different generic types: `KafkaTemplate<String, OrderEvent>` and `KafkaTemplate<String, PaymentEvent>` both sending to `"transaction-events"`
+- Two services with different Pydantic models / structs producing to the same topic
+- A single producer that sends different types conditionally: `if (type == "user") send(topic, userEvent) else send(topic, paymentEvent)`
+
+**When a multi-schema topic is found:**
+
+1. Register each event type as its own subject (not the topic-based subject):
+   - e.g., `UserEvent` → subject `user-event`, `PaymentEvent` → subject `payment-event`
+
+2. Create a **wrapper schema** using `oneOf` (JSON Schema), union (Avro), or `oneof` (Protobuf)
+   that references the individual event schemas. Register it as the topic subject:
+
+   **JSON Schema wrapper:**
+   ```json
+   {
+     "$schema": "http://json-schema.org/draft-07/schema#",
+     "title": "{TopicName}Event",
+     "oneOf": [
+       { "$ref": "{event-type-1}.json" },
+       { "$ref": "{event-type-2}.json" }
+     ]
+   }
+   ```
+
+   **Avro wrapper:**
+   ```json
+   [
+     "{namespace}.EventType1",
+     "{namespace}.EventType2"
+   ]
+   ```
+
+   **Protobuf wrapper:**
+   ```protobuf
+   import "{event_type_1}.proto";
+   import "{event_type_2}.proto";
+
+   message {TopicName}Event {
+     oneof event {
+       EventType1 type1 = 1;
+       EventType2 type2 = 2;
+     }
+   }
+   ```
+
+3. Generate Terraform with `schema_reference` blocks:
+   ```hcl
+   # Individual event schemas registered first
+   resource "confluent_schema" "user_event" {
+     subject_name = "user-event"
+     format       = "{FORMAT}"
+     schema       = file("../schemas/{dir}/user-event.{ext}")
+   }
+
+   resource "confluent_schema" "payment_event" {
+     subject_name = "payment-event"
+     format       = "{FORMAT}"
+     schema       = file("../schemas/{dir}/payment-event.{ext}")
+   }
+
+   # Wrapper schema with references
+   resource "confluent_schema" "{topic}_value" {
+     subject_name = "{topic}-value"
+     format       = "{FORMAT}"
+     schema       = file("../schemas/{dir}/{topic}-value.{ext}")
+
+     schema_reference {
+       name         = "{reference_name}"
+       subject_name = confluent_schema.user_event.subject_name
+       version      = confluent_schema.user_event.version
+     }
+
+     schema_reference {
+       name         = "{reference_name}"
+       subject_name = confluent_schema.payment_event.subject_name
+       version      = confluent_schema.payment_event.version
+     }
+   }
+   ```
+
+4. Flag multi-schema topics prominently in the report with a cross-reference table
+
+**Same data model, multiple topics (dedup):**
+If the same class produces to multiple topics (e.g., `order-events` and `order-events-dlq`),
+generate one schema file and multiple Terraform `confluent_schema` resources pointing to the
+same file:
+```hcl
+resource "confluent_schema" "order_events_value" {
+  subject_name = "order-events-value"
+  schema       = file("../schemas/json/order-event.json")
+  ...
+}
+
+resource "confluent_schema" "order_events_dlq_value" {
+  subject_name = "order-events-dlq-value"
+  schema       = file("../schemas/json/order-event.json")  # same file
+  ...
+}
+```
+
 ---
 
 ## Phase 2: Risk Detection — `auto.register.schemas=true`
@@ -1209,6 +1322,20 @@ to inject the schema ID into Kafka headers. The payload stays byte-identical.
 
 Payload stays byte-identical across all languages. Schema ID goes to Kafka headers.
 **Non-breaking** for all existing consumers.
+
+---
+
+## Multi-Schema Topics
+
+Topics where multiple event types are produced by different data models.
+A wrapper schema with `oneOf`/union/`oneof` has been generated with `schema_reference`
+blocks pointing to the individual event schemas.
+
+| Topic | Event Types | Wrapper Schema | References |
+|-------|-------------|---------------|------------|
+| {topic} | {EventType1}, {EventType2} | schemas/{dir}/{topic}-value.{ext} | {event-type-1}, {event-type-2} |
+
+> If no multi-schema topics are found, omit this section.
 
 ---
 
