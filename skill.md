@@ -848,10 +848,11 @@ Classify each producer into a category based on findings:
 | Category | Criteria | Action |
 |----------|----------|--------|
 | **A: Compliant** | Uses Confluent serializer + schema.registry.url configured + no auto.register | Report as compliant. Still extract schema to Terraform if not already managed by IaC. |
+| **A→Header: Already on SR, migrating to headers** | Uses Confluent serializer + SR, wants to move schema ID from payload prefix to Kafka headers | No schema extraction needed. Add `HeaderSchemaIdSerializer` to producers. Consumers need no changes — `DualSchemaIdDeserializer` is the default. See rollout ordering below. |
 | **B: Schema in code, no SR** | Has data models/classes but uses StringSerializer, JsonSerializer (Spring), kafka-python, kafkajs raw, or no Confluent SR integration | Extract schema → `terraform/schemas.tf` + add upgrade recommendation to report |
 | **C: Auto-register** | Has `auto.register.schemas=true` | Extract schema → `terraform/flagged-auto-register.tf` (commented out) + flag risk in report |
 | **D: No schema** | Raw strings/bytes, no discernible data model, hardcoded JSON strings | Flag in report with recommendation to adopt schema-first approach |
-| **E: Custom serializer** | Implements `Serializer<T>` interface, uses `json.dumps`/`JSON.stringify`/`JsonConvert`/`json.Marshal`/`GenericDatumWriter`/`fastavro`/`proto.Marshal` inline, or has a custom serialization function — all without SR | Extract schema from the data model inside the custom serializer → `terraform/schemas.tf` + recommend replacing with the appropriate Confluent serializer based on format (see upgrade rules below) |
+| **E: Custom serializer** | Implements `Serializer<T>` interface, uses `json.dumps`/`JSON.stringify`/`JsonConvert`/`json.Marshal`/`GenericDatumWriter`/`fastavro`/`proto.Marshal` inline, or has a custom serialization function — all without SR | Extract schema from the data model inside the custom serializer → `terraform/schemas.tf` + recommend replacing with Confluent serializer + `HeaderSchemaIdSerializer`. Consumers must be upgraded first — Java: `CompositeDeserializer`. See upgrade rules below. |
 
 ---
 
@@ -1204,60 +1205,25 @@ Create a comprehensive markdown report at the repo root:
 
 **Recommendation:**
 
-Do NOT replace the custom serializer with a Confluent serializer — that changes the payload
-format or wire encoding, which **breaks all existing consumers**.
+Replace the custom serializer with a Confluent serializer + `HeaderSchemaIdSerializer`.
+The payload format will change, so **consumers must be upgraded first**.
 
 1. Register the schema in Schema Registry via Terraform (already generated in `terraform/schemas.tf`)
-2. Keep the existing custom serializer — the payload does not change
+2. **Upgrade consumers first** — Java: switch to `CompositeDeserializer` to handle both old (custom) and new (Confluent) formats during the transition. Other languages: coordinated cutover.
+3. **Replace the custom serializer** with the appropriate Confluent serializer (`KafkaAvroSerializer`, `ProtobufSerializer`, or `KafkaJsonSchemaSerializer`) and add `HeaderSchemaIdSerializer` to write schema ID to Kafka headers.
+4. After all old data has been consumed or expired, replace `CompositeDeserializer` with the standard Confluent deserializer.
 
-3. Configure the schema ID to be written to Kafka **headers** instead of the payload prefix.
-   The payload stays byte-identical. **Existing consumers will not break.**
-
-   **Java:**
-   ```properties
-   value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
-   ```
-
-   **Python (confluent-kafka >= 2.10.1):**
-   ```python
-   from confluent_kafka.schema_registry import header_schema_id_serializer
-   # Pass to serializer config:
-   serializer = AvroSerializer(sr_client, schema_str,
-       conf={'schema.id.serializer': header_schema_id_serializer})
-   ```
-
-   **.NET (Confluent.Kafka >= 2.10.1):**
-   ```csharp
-   // In serializer config, set SchemaIdStrategy to Header:
-   var config = new JsonSerializerConfig
-   {
-       SchemaIdStrategy = SchemaIdSerializerStrategy.Header
-   };
-   ```
-
-   **Go (confluent-kafka-go >= 2.10.1):**
-   ```go
-   import "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
-   // Pass serde.HeaderSchemaIDSerializer as the schema ID serializer function
-   // Header keys: serde.KeySchemaIDHeader ("__key_schema_id")
-   //              serde.ValueSchemaIDHeader ("__value_schema_id")
-   ```
-
-   **Node.js (@confluentinc/kafka-javascript >= 1.3.2):**
-   ```typescript
-   import { HeaderSchemaIdSerializer } from '@confluentinc/kafka-javascript/schemaregistry/serde';
-   // Pass HeaderSchemaIdSerializer via schemaIdSerializer in SerializerConfig
-   // Header keys: __key_schema_id, __value_schema_id
-   ```
-
-4. Schema governance is in place: schema in SR, schema ID in headers, compatibility checks enforced.
+See detailed upgrade instructions in the "Upgrade Quick Reference — Custom Serializers" section below.
 
 > **Minimum versions required:**
-> - Java: any version (HeaderSchemaIdSerializer has been available)
-> - Python: confluent-kafka >= 2.10.1
-> - .NET: Confluent.Kafka >= 2.10.1
-> - Go: confluent-kafka-go >= 2.10.1
-> - Node.js: @confluentinc/kafka-javascript >= 1.3.2
+> - Java: CP client >= 8.1.1
+> - C/C++: libserdes >= 0.1.0
+> - Python: confluent-kafka >= 2.13.0
+> - .NET: Confluent.Kafka >= 2.13.0
+> - Go: confluent-kafka-go >= 2.13.0
+> - Node.js: @confluentinc/kafka-javascript >= 1.8.0
+>
+> **Consumer side — `DualSchemaIdDeserializer`.** All Confluent client libraries on supported versions default to `DualSchemaIdDeserializer`, which automatically checks Kafka headers first (`__value_schema_id` / `__key_schema_id`) and falls back to the payload prefix. Once consumers are on the Confluent deserializer, no further config change is needed when producers switch to `HeaderSchemaIdSerializer`.
 
 See per-app upgrade instructions in the "Producer Upgrade Recommendations" section below.
 
@@ -1292,8 +1258,7 @@ For producers with schemas in code but no Schema Registry integration (Category 
 Replace the serializer with the Confluent JSON serializer + header-based schema ID.
 Payload stays clean JSON. Schema ID goes to Kafka headers. **Non-breaking** for consumers.
 
-> **Minimum version:** Schema ID in headers requires Confluent client >= 2.10.1
-> (Java has supported it longer via `HeaderSchemaIdSerializer`).
+> **Minimum versions:** Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
 
 | Current State | Recommended Serializer | Config Changes |
 |--------------|----------------------|----------------|
@@ -1301,27 +1266,74 @@ Payload stays clean JSON. Schema ID goes to Kafka headers. **Non-breaking** for 
 | Java `JsonSerializer` (Spring) | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add Confluent dependency, update serializer class |
 | Python `kafka-python` + `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Replace library, use `SerializingProducer`, set `schema.id.serializer` |
 | Python `confluent-kafka` + inline `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Remove inline serialization, set `schema.id.serializer` |
-| .NET `JsonConvert` / `System.Text.Json` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` + header mode | Add NuGet (>= 2.10.1), configure header-based schema ID |
+| .NET `JsonConvert` / `System.Text.Json` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` + header mode | Add NuGet (>= 2.13.0), configure header-based schema ID |
 | Go `json.Marshal` before `Produce()` | `confluent-kafka-go` JSON serializer + header mode | Remove manual marshal, add SR client, configure header-based schema ID |
 | Node `kafkajs` + `JSON.stringify` | `@confluentinc/kafka-javascript` with SR + header mode | Replace library, remove inline serialization, configure header-based schema ID |
 
 ### Upgrade Quick Reference — Custom Serializers (Category E)
 
-Do NOT replace the custom serializer. Keep it as-is and add header-based schema ID
-to inject the schema ID into Kafka headers. The payload stays byte-identical.
+Replace the custom serializer with a Confluent serializer. The payload format changes, so **consumers must be upgraded first** to handle both old and new formats during the transition.
 
-> **Minimum version:** Schema ID in headers requires Confluent client >= 2.10.1.
+> **Rollout order: consumers first, then producers.**
+> **Minimum versions:** Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
 
-| Language | Current State | Recommendation | Config |
-|----------|--------------|---------------|--------|
-| Java | Custom `Serializer<T>` (any format) | Keep serializer + add `HeaderSchemaIdSerializer` | `value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer` |
-| Python (>= 2.10.1) | Custom serializer / `fastavro` / `proto` | Keep serializer + add `header_schema_id_serializer` | `conf={'schema.id.serializer': header_schema_id_serializer}` |
-| .NET (>= 2.10.1) | Custom `ISerializer<T>` (any format) | Keep serializer + set `SchemaIdStrategy = SchemaIdSerializerStrategy.Header` | `SchemaIdStrategy = SchemaIdSerializerStrategy.Header` in serializer config |
-| Go (>= 2.10.1) | Custom serializer / `goavro` / `proto.Marshal` | Keep serializer + use `serde.HeaderSchemaIDSerializer` | Pass `serde.HeaderSchemaIDSerializer` as schema ID serializer function |
-| Node.js (>= 1.3.2) | Custom serializer | Keep serializer + use `HeaderSchemaIdSerializer` | Pass `HeaderSchemaIdSerializer` via `schemaIdSerializer` in `SerializerConfig` |
+**Step 1 — Upgrade all consumers (before touching producers):**
 
-Payload stays byte-identical across all languages. Schema ID goes to Kafka headers.
-**Non-breaking** for all existing consumers.
+*Java — use `CompositeDeserializer`:*
+```java
+props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+    "io.confluent.kafka.serializers.CompositeDeserializer");
+props.put("composite.old.deserializer", "com.acme.CustomDeserializer");
+// Match the format you'll use on producers:
+props.put("composite.confluent.deserializer",
+    "io.confluent.kafka.serializers.KafkaAvroDeserializer");  // or ProtobufDeserializer, KafkaJsonSchemaDeserializer
+```
+
+The `CompositeDeserializer` checks for a schema ID (header or payload). If found, it uses the Confluent deserializer. If not, it falls back to the custom deserializer. This lets consumers read both old-format and new-format data during the migration.
+
+*Python / .NET / Go / Node.js:*
+These languages do not have a `CompositeDeserializer`. Deploy a new consumer version that can handle both formats, or do a coordinated cutover.
+
+**Step 2 — Upgrade all producers:**
+
+Replace the custom serializer with the Confluent serializer for the chosen format:
+
+| Language | Recommended Serializer | Config |
+|----------|----------------------|--------|
+| Java | `KafkaAvroSerializer` / `ProtobufSerializer` / `KafkaJsonSchemaSerializer` | Set `value.serializer`, `schema.registry.url`, `value.schema.id.serializer=HeaderSchemaIdSerializer` |
+| Python | `confluent-kafka` `AvroSerializer` / `ProtobufSerializer` / `JSONSerializer` | Use `SerializingProducer`, set `schema.id.serializer` |
+| .NET | `Confluent.SchemaRegistry.Serdes` serializer + header mode | Add NuGet, configure header-based schema ID |
+| Go | `confluent-kafka-go` serializer + header mode | Add SR client, configure header-based schema ID |
+| Node | `@confluentinc/kafka-javascript` with SR + header mode | Replace library, configure header-based schema ID |
+
+Once all producers are upgraded, consumers read new data via the Confluent deserializer and old data via the custom deserializer (Java `CompositeDeserializer`). After all old data has been consumed or expired, the `CompositeDeserializer` can be replaced with the standard Confluent deserializer.
+
+---
+
+## Migration Rollout Ordering
+
+The order you upgrade producers vs consumers depends on your starting point. Getting this wrong can cause deserialization failures.
+
+### Scenario 1: JSON data, no SR (Category B) — Producers First
+
+Consumers today read raw JSON and ignore Kafka headers. Safe to upgrade producers first.
+
+1. **Upgrade all producers** — switch to Confluent serializer + `HeaderSchemaIdSerializer`. Schema ID goes to headers; payload stays clean JSON. Existing consumers keep working.
+2. **Upgrade consumers** — switch to Confluent deserializer. `DualSchemaIdDeserializer` (the default) finds schema ID in headers automatically.
+
+### Scenario 2: Already on SR (Category A→Header) — Producers Only
+
+Consumers already use Confluent deserializers. `DualSchemaIdDeserializer` is the default and automatically checks headers first, then falls back to payload. **No consumer changes needed** — just verify consumers are on supported versions.
+
+1. **Verify consumer versions** — Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
+2. **Upgrade producers** — add `HeaderSchemaIdSerializer`. Everything else stays the same.
+
+### Scenario 3: Custom serdes → Confluent serdes (Category E) — Consumers First
+
+The payload format changes when replacing custom serializers with Confluent serializers, so consumers must be upgraded first.
+
+1. **Upgrade all consumers** — Java: switch to `CompositeDeserializer` (see Category E upgrade above). Other languages: coordinated cutover.
+2. **Upgrade all producers** — replace custom serializer with Confluent serializer + `HeaderSchemaIdSerializer`.
 
 ---
 
@@ -1385,14 +1397,16 @@ These tags enable Confluent Stream Governance features like field-level encrypti
 
 Topics where serializer changes may affect consumers:
 
-| Topic | Producers Changing | Active Consumers | Risk |
-|-------|-------------------|-----------------|------|
-| {topic} | {app changing serializer} | {consumer apps} | {impact description} |
+| Topic | Category | Producers Changing | Active Consumers | Rollout Order | Consumer Action |
+|-------|----------|-------------------|-----------------|---------------|-----------------|
+| {topic} | B | {app} | {consumers} | Producers first | None during migration. Eventually upgrade to Confluent deserializer. |
+| {topic} | A→Header | {app} | {consumers} | Producers only | None — `DualSchemaIdDeserializer` handles both header and payload automatically. Verify client version. |
+| {topic} | E | {app} | {consumers} | Consumers first | Java: switch to `CompositeDeserializer`. Other langs: coordinated cutover. |
 
-> **Mitigation:** Using `HeaderSchemaIdSerializer` for JSON ensures backward
-> compatibility. Existing consumers parsing raw JSON will not break.
-> For Avro/Protobuf migrations, consumers must also be updated to use
-> Confluent deserializers.
+> **`DualSchemaIdDeserializer`:** All Confluent client libraries on supported versions
+> default to this deserializer. It checks Kafka headers first, then falls back to the
+> payload prefix. No consumer configuration change is needed when producers switch to
+> `HeaderSchemaIdSerializer`.
 
 ---
 
@@ -1404,8 +1418,11 @@ Topics where serializer changes may affect consumers:
 4. [ ] Configure Terraform variables (SR cluster ID, endpoint, API credentials)
 5. [ ] Run `terraform plan` to preview schema registration
 6. [ ] Run `terraform apply` to register schemas
-7. [ ] Update Category B and E producers per upgrade recommendations above
-8. [ ] Remove custom serializer classes/functions after migrating to Confluent serializers
+7. [ ] Follow rollout ordering per category (see Migration Rollout Ordering section):
+   - Category B: upgrade producers first, then consumers
+   - Category A→Header: verify consumer versions, then upgrade producers
+   - Category E: upgrade consumers first (`CompositeDeserializer` for Java), then replace custom serializer with Confluent serializer
+8. [ ] For Category E: after all old data is consumed, replace `CompositeDeserializer` with standard Confluent deserializer
 9. [ ] Uncomment `flagged-auto-register.tf` resources after disabling auto-register
 10. [ ] Add schema lint/validate to CI/CD pipeline
 ```
