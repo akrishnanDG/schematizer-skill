@@ -1,3 +1,8 @@
+---
+name: kafka-repo-analyzer
+description: Scan a repository to identify Kafka applications, extract schemas from data models, tag PII fields, generate Terraform for Confluent Schema Registry registration, and produce a migration report with rollout ordering. Use this skill when a user asks to analyze a repo for Kafka usage, extract schemas, audit producer/consumer configurations, or generate Terraform for Schema Registry.
+---
+
 # Kafka Repo Analyzer
 
 Scan a repository to identify Kafka applications, extract schemas, generate Terraform for Schema Registry registration, and produce a comprehensive analysis report.
@@ -829,7 +834,7 @@ Call schema_lint with:
   path: <schema file or schemas/ directory>
   fix: true
 ```
-Fix any warnings — they prevent real problems during schema evolution.
+Fix any warnings — they prevent real problems during schema evolution. See [Schema Registry compatibility types](https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html) for details on BACKWARD, FORWARD, and FULL compatibility modes.
 
 **If MCP tools are not available:**
 - Manually review each schema for:
@@ -924,6 +929,8 @@ Call schema_validate with:
 
 ## Phase 6: Generate Terraform
 
+See [Confluent Terraform Provider docs](https://registry.terraform.io/providers/confluentinc/confluent/latest/docs) for full resource reference.
+
 ### 6.1 `terraform/providers.tf`
 
 ```hcl
@@ -974,7 +981,7 @@ variable "schema_registry_api_secret" {
 
 ### 6.3 `terraform/tags.tf`
 
-**Important:** Confluent Stream Governance requires tags to be pre-created in the catalog before schemas can embed `confluent:tags`. Generate a `confluent_tag` resource for each tag used in the schemas:
+**Important:** Confluent Stream Governance requires tags to be pre-created in the catalog before schemas can embed `confluent:tags`. See [Stream Governance tags](https://docs.confluent.io/cloud/current/stream-governance/stream-catalog-rest-apis.html). Generate a `confluent_tag` resource for each tag used in the schemas:
 
 ```hcl
 # ──────────────────────────────────────────────
@@ -1280,7 +1287,7 @@ Replace the custom serializer with a Confluent serializer. The payload format ch
 **Step 1 — Upgrade all consumers (before touching producers):**
 
 *Java:*
-Configure a composite deserializer that wraps both the old custom deserializer and the new Confluent deserializer. The composite deserializer inspects each message for a schema ID (in the header or payload prefix). If a schema ID is found, it delegates to the Confluent deserializer. If not, it falls back to the old custom deserializer. This lets consumers read both old-format and new-format data during the migration. See the [Confluent migration guidelines](https://docs.confluent.io) for the exact configuration properties.
+Configure a composite deserializer that wraps both the old custom deserializer and the new Confluent deserializer. The composite deserializer inspects each message for a schema ID (in the header or payload prefix). If a schema ID is found, it delegates to the Confluent deserializer. If not, it falls back to the old custom deserializer. This lets consumers read both old-format and new-format data during the migration. See the [Confluent Schema Registry serializer/deserializer docs](https://docs.confluent.io/platform/current/schema-registry/serdes-develop/index.html) for the exact configuration properties.
 
 *Python / .NET / Go / Node.js:*
 These languages do not have a composite deserializer. Deploy a new consumer version that can handle both formats, or do a coordinated cutover.
