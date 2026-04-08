@@ -724,24 +724,29 @@ For each data model found, generate a schema file. **Tag potential PII fields** 
 - Add `$schema: "http://json-schema.org/draft-07/schema#"`
 - Add `title` matching the class/model name
 - Add `confluent:tags` to PII fields (see 3.3b)
+- **Add `"additionalProperties": false`** to prevent undeclared fields from bypassing schema validation
+- **Add `"default"` values** on optional properties for schema evolution safety
 
-Example with PII tags:
+Example with PII tags and evolution defaults:
 ```json
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Customer",
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "customer_id": { "type": "string" },
     "email": {
       "type": "string",
+      "default": "",
       "confluent:tags": ["PII"]
     },
     "phone_number": {
       "type": "string",
+      "default": "",
       "confluent:tags": ["PII"]
     },
-    "order_total": { "type": "number" }
+    "order_total": { "type": "number", "default": 0 }
   },
   "required": ["customer_id", "email"]
 }
@@ -752,8 +757,19 @@ Example with PII tags:
 - Map types: `String→string`, `int→int`, `long→long`, `float→float`, `double→double`, `boolean→boolean`, `List→array`, `Map→map`
 - Use `["null", "type"]` union for nullable/optional fields with `"default": null`
 - Add `confluent:tags` to PII fields (see 3.3b)
+- **Add defaults for schema evolution** (see below)
 
-Example with PII tags:
+**Schema evolution defaults (Avro):** Every optional field MUST have a `default` value. Without defaults, adding or removing fields later will break backward compatibility. Use these defaults by type:
+- `string` → `"default": ""`
+- `int`, `long` → `"default": 0`
+- `float`, `double` → `"default": 0.0`
+- `boolean` → `"default": false`
+- nullable union `["null", "type"]` → `"default": null`
+- `enum` → `"default": "<first symbol>"` (for forward compatibility)
+
+Only the primary key / identifier field(s) should omit a default (they are always required).
+
+Example with PII tags and evolution defaults:
 ```json
 {
   "type": "record",
@@ -764,14 +780,16 @@ Example with PII tags:
     {
       "name": "email",
       "type": "string",
+      "default": "",
       "confluent:tags": ["PII"]
     },
     {
       "name": "ssn",
-      "type": "string",
+      "type": ["null", "string"],
+      "default": null,
       "confluent:tags": ["PII", "PRIVATE"]
     },
-    { "name": "order_total", "type": "double" }
+    { "name": "order_total", "type": "double", "default": 0.0 }
   ]
 }
 ```
@@ -792,11 +810,8 @@ import "confluent/meta.proto";
 
 message Customer {
   string customer_id = 1;
-  string email = 2 [(confluent.field_meta).tags = "PII"];
-  string ssn = 3 [
-    (confluent.field_meta).tags = "PII",
-    (confluent.field_meta).tags = "PRIVATE"
-  ];
+  string email = 2 [(confluent.field_meta) = { tags: ["PII"] }];
+  string ssn = 3 [(confluent.field_meta) = { tags: ["PII", "PRIVATE"] }];
   double order_total = 4;
 }
 ```
@@ -839,7 +854,7 @@ When generating schemas, scan every field name for potential PII and add `conflu
 
 - **Avro:** Add `"confluent:tags": ["PII"]` as a sibling to `name` and `type` on the field
 - **JSON Schema:** Add `"confluent:tags": ["PII"]` as a sibling to `type` on the property
-- **Protobuf:** Add `[(confluent.field_meta).tags = "PII"]` after the field number; must import `confluent/meta.proto`
+- **Protobuf:** Add `[(confluent.field_meta) = { tags: ["PII"] }]` after the field number; for multiple tags use `[(confluent.field_meta) = { tags: ["PII", "PRIVATE"] }]`; must import `confluent/meta.proto`
 
 **Report PII findings:** In the report, add a PII summary table showing all tagged fields, their schemas, and the tags applied. This gives teams visibility into what PII is flowing through Kafka.
 

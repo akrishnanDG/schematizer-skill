@@ -621,7 +621,7 @@ candidates:
     # Event design
     event_name: "{PascalCase}Event"
     recommended_topic: "{domain}.{entity}.{verb}"
-    schema_format: "JSON"
+    schema_format: "{JSON|AVRO|PROTOBUF}"  # See "Schema Format Selection" below
     business_question: "{one sentence — what business question does this answer?}"
     reasoning: "{why this is a good Kafka event candidate}"
 
@@ -682,7 +682,7 @@ events:
   - name: "{EventName}"
     topic: "{recommended_topic}"
     subject: "{topic}-value"
-    schema_type: "JSON"  # or AVRO, PROTOBUF
+    schema_type: "{JSON|AVRO|PROTOBUF}"  # Detect from repo — see "Schema Format Selection"
     compatibility: "BACKWARD"
     source:
       service: "{service_name}"
@@ -725,6 +725,20 @@ events:
   # ... more events
 ```
 
+### Schema Format Selection
+
+Do **not** hardcode JSON as the schema format. Detect the appropriate format:
+
+1. **If Audit ran first (combined mode):** Use the dominant format found in the Audit catalog. If 80%+ of existing producers use Avro, recommend Avro for new events. If mixed, match per-service.
+2. **If the repo has existing schema files:** Check for `.avsc` (Avro), `.proto` (Protobuf), or `.json` (JSON Schema) files. Match the existing format.
+3. **If the repo has Confluent SR dependencies:** Check the serializer libraries in build files:
+   - `kafka-avro-serializer` / `kafka-streams-avro-serde` → AVRO
+   - `kafka-protobuf-serializer` / `kafka-streams-protobuf-serde` → PROTOBUF
+   - `kafka-json-schema-serializer` / `kafka-streams-json-schema-serde` → JSON
+4. **If no signal exists:** Default to JSON (lowest barrier, no code generation needed).
+
+Set the `schema_format` field per candidate in `kafka_recommendations.yaml` and `schema_type` in `kafka_schemas.yaml` accordingly.
+
 ### D4.4 Generate Patch Files
 
 For each candidate, create a git-apply-ready patch at `discover/patches/{service}-kafka-producer.patch`.
@@ -751,110 +765,193 @@ For each candidate, create a git-apply-ready patch at `discover/patches/{service
 
 **Language-specific producer code to insert:**
 
-**Java (Spring Kafka):**
+> **Schema Registry + HeaderSchemaIdSerializer:** All patches use Confluent serializers
+> with `HeaderSchemaIdSerializer` so the schema ID goes into Kafka headers (not the payload).
+> This keeps payloads clean and enables Schema Registry governance from day one.
+> Existing consumers that parse raw JSON will continue to work — the payload format is unchanged.
+>
+> **Minimum client versions:** Java 8.1.1+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
+
+**Java (Spring Kafka + Confluent SR):**
 ```java
 // Import
 import org.springframework.kafka.core.KafkaTemplate;
 
-// Field
-private final KafkaTemplate<String, String> kafkaTemplate;
+// Field — use the schema-typed template, not KafkaTemplate<String, String>
+private final KafkaTemplate<String, {EventClass}> kafkaTemplate;
 
 // Constructor parameter
-// Add to existing constructor: KafkaTemplate<String, String> kafkaTemplate
+// Add to existing constructor: KafkaTemplate<String, {EventClass}> kafkaTemplate
 // Add to constructor body: this.kafkaTemplate = kafkaTemplate;
 
 // Producer call (at end of mutation method, before return)
-kafkaTemplate.send("{topic}", {keyExpression},
-    objectMapper.writeValueAsString({eventObject}));
+kafkaTemplate.send("{topic}", {keyExpression}, {eventObject});
 ```
 
-**Python (confluent-kafka):**
+**Java — required Spring config (application.properties or application.yml):**
+```properties
+spring.kafka.producer.value-serializer=io.confluent.kafka.serializers.json.KafkaJsonSchemaSerializer
+spring.kafka.producer.properties.schema.registry.url=${SCHEMA_REGISTRY_URL}
+spring.kafka.producer.properties.basic.auth.credentials.source=USER_INFO
+spring.kafka.producer.properties.basic.auth.user.info=${SCHEMA_REGISTRY_API_KEY}:${SCHEMA_REGISTRY_API_SECRET}
+spring.kafka.producer.properties.auto.register.schemas=false
+spring.kafka.producer.properties.use.latest.version=true
+spring.kafka.producer.properties.value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
+```
+
+**Java — required dependency (add to pom.xml or build.gradle):**
+```xml
+<!-- pom.xml -->
+<dependency>
+    <groupId>io.confluent</groupId>
+    <artifactId>kafka-json-schema-serializer</artifactId>
+    <version>8.2.0</version>
+</dependency>
+```
+```groovy
+// build.gradle
+implementation 'io.confluent:kafka-json-schema-serializer:8.2.0'
+```
+
+**Python — required dependency (add to requirements.txt or pyproject.toml):**
+```
+confluent-kafka[schema-registry]>=2.13.0
+```
+
+**Python (confluent-kafka + SR):**
 ```python
 # Import
-from confluent_kafka import Producer
-import json
+from confluent_kafka import SerializingProducer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.json_schema import JSONSerializer
+from confluent_kafka.schema_registry.schema_id import HeaderSchemaIdSerializer
 import os
 
 # Initialization (in __init__ or module level)
-self._kafka_producer = Producer({
-    'bootstrap.servers': os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
+sr_client = SchemaRegistryClient({
+    'url': os.environ.get('SCHEMA_REGISTRY_URL', 'http://localhost:8081'),
+    'basic.auth.user.info': f"{os.environ.get('SCHEMA_REGISTRY_API_KEY', '')}:{os.environ.get('SCHEMA_REGISTRY_API_SECRET', '')}"
+})
+json_serializer = JSONSerializer(schema_str, sr_client)
+
+self._kafka_producer = SerializingProducer({
+    'bootstrap.servers': os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'),
+    'value.serializer': json_serializer,
+    'value.schema.id.serializer': HeaderSchemaIdSerializer(),
 })
 
-# Producer call (after mutation logic)
+# Producer call (after mutation logic) — pass the dict directly, not json.dumps
 self._kafka_producer.produce(
     '{topic}',
     key=str({key_expression}),
-    value=json.dumps({event_dict})
+    value={event_dict}
 )
 self._kafka_producer.flush()
 ```
 
-**.NET (Confluent.Kafka):**
+**.NET (Confluent.Kafka + SR):**
 ```csharp
 // Using
 using Confluent.Kafka;
-using System.Text.Json;
+using Confluent.SchemaRegistry;
+using Confluent.SchemaRegistry.Serdes;
 
-// Field
-private readonly IProducer<string, string> _producer;
+// Fields
+private readonly IProducer<string, {EventClass}> _producer;
+private readonly ISchemaRegistryClient _srClient;
 
-// Constructor injection
-// Add parameter: IProducer<string, string> producer
-// Add assignment: _producer = producer;
+// Constructor initialization
+// _srClient = new CachedSchemaRegistryClient(new SchemaRegistryConfig
+// {
+//     Url = Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_URL"),
+//     BasicAuthCredentialsSource = AuthCredentialsSource.UserInfo,
+//     BasicAuthUserInfo = $"{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_KEY")}:{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_SECRET")}"
+// });
+// _producer = new ProducerBuilder<string, {EventClass}>(producerConfig)
+//     .SetValueSerializer(new JsonSerializer<{EventClass}>(_srClient, schemaRegistryConfig: new SchemaRegistryConfig { SchemaIdLocation = SchemaIdLocation.Header }))
+//     .Build();
 
-// Producer call
-await _producer.ProduceAsync("{topic}", new Message<string, string>
+// Producer call — pass the typed object directly
+await _producer.ProduceAsync("{topic}", new Message<string, {EventClass}>
 {
     Key = {keyExpression},
-    Value = JsonSerializer.Serialize({eventObject})
+    Value = {eventObject}
 });
 ```
 
-**Go (confluent-kafka-go):**
+**.NET — required NuGet packages:**
+```
+Confluent.SchemaRegistry.Serdes.Json >= 2.13.0
+```
+
+**Go — required dependency:**
+```
+go get github.com/confluentinc/confluent-kafka-go/v2@v2.13.0
+```
+
+**Go (confluent-kafka-go + SR):**
 ```go
 // Import
 import (
-    "encoding/json"
     "github.com/confluentinc/confluent-kafka-go/v2/kafka"
+    "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
+    "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
+    "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/jsonschema"
 )
 
-// Field in struct
-producer *kafka.Producer
+// Fields in struct
+producer   *kafka.Producer
+serializer *jsonschema.Serializer
 
-// Producer call
-eventBytes, _ := json.Marshal({eventStruct})
+// Initialization
+// srClient, _ := schemaregistry.NewClient(schemaregistry.NewConfigWithAuthentication(
+//     os.Getenv("SCHEMA_REGISTRY_URL"),
+//     os.Getenv("SCHEMA_REGISTRY_API_KEY"),
+//     os.Getenv("SCHEMA_REGISTRY_API_SECRET")))
+// s.serializer, _ = jsonschema.NewSerializer(srClient, serde.ValueSerde, jsonschema.NewSerializerConfig())
+
+// Producer call — serialize via SR, not json.Marshal
+payload, _ := s.serializer.Serialize("{topic}", {eventStruct})
 topic := "{topic}"
 s.producer.Produce(&kafka.Message{
     TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
     Key:            []byte({keyExpression}),
-    Value:          eventBytes,
+    Value:          payload,
 }, nil)
 ```
 
-**Node/TS (kafkajs):**
+**Node/TS (@confluentinc/kafka-javascript + SR):**
 ```typescript
-// Import
-import { Kafka, Producer } from 'kafkajs';
+// Import — use Confluent's client, not kafkajs
+import { SchemaRegistry, SchemaType } from '@confluentinc/schemaregistry';
+import { Kafka, Producer } from '@confluentinc/kafka-javascript';
 
-// Field
+// Fields
 private producer: Producer;
+private registry: SchemaRegistry;
 
 // Initialization
+// this.registry = new SchemaRegistry({
+//   host: process.env.SCHEMA_REGISTRY_URL || 'http://localhost:8081',
+//   auth: { username: process.env.SCHEMA_REGISTRY_API_KEY, password: process.env.SCHEMA_REGISTRY_API_SECRET },
+// });
 // const kafka = new Kafka({ brokers: [process.env.KAFKA_BROKERS || 'localhost:9092'] });
 // this.producer = kafka.producer();
 // await this.producer.connect();
 
-// Producer call
+// Producer call — encode via SR
+const schemaId = await this.registry.getLatestSchemaId('{topic}-value');
+const encodedValue = await this.registry.encode(schemaId, {eventObject});
 await this.producer.send({
   topic: '{topic}',
   messages: [{
     key: String({keyExpression}),
-    value: JSON.stringify({eventObject}),
+    value: encodedValue,
   }],
 });
 ```
 
-**PHP (rdkafka):**
+**PHP (rdkafka + SR):**
 ```php
 // Use
 use RdKafka\Producer;
@@ -866,11 +963,16 @@ private Producer $kafkaProducer;
 // Initialization (in constructor)
 // $conf = new Conf();
 // $conf->set('metadata.broker.list', env('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'));
+// $conf->set('schema.registry.url', env('SCHEMA_REGISTRY_URL', 'http://localhost:8081'));
 // $this->kafkaProducer = new Producer($conf);
 
 // Producer call
+// Note: PHP rdkafka does not have native SR integration.
+// Use the Confluent REST Proxy or register schemas via Terraform and
+// manually add the schema ID header. See the Audit report for details.
 $topic = $this->kafkaProducer->newTopic('{topic}');
-$topic->produce(RD_KAFKA_PARTITION_UA, 0, json_encode({eventArray}), {keyExpression});
+$headers = ['__value_schema_id' => pack('N', {schemaId})];
+$topic->producev(RD_KAFKA_PARTITION_UA, 0, json_encode({eventArray}), {keyExpression}, $headers);
 $this->kafkaProducer->flush(1000);
 ```
 
