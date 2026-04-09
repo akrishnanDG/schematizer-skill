@@ -1451,12 +1451,11 @@ The payload format will change, so **consumers must be upgraded first**.
 See detailed upgrade instructions in the "Upgrade Quick Reference — Custom Serializers" section below.
 
 > **Minimum versions required:**
-> - Java: CP client >= 8.1.1
-> - C/C++: libserdes >= 0.1.0
-> - Python: confluent-kafka >= 2.13.0
-> - .NET: Confluent.Kafka >= 2.13.0
-> - Go: confluent-kafka-go >= 2.13.0
-> - Node.js: @confluentinc/kafka-javascript >= 1.8.0
+> - Java: CP client >= 8.0
+> - Python: confluent-kafka >= 2.10.1
+> - Go: confluent-kafka-go >= 2.10.1
+> - .NET: Confluent.Kafka >= 2.10.1
+> - Node.js: @confluentinc/kafka-javascript >= 1.3.2
 >
 > **Consumer side — automatic dual-read.** All Confluent client libraries on supported versions automatically check Kafka headers first (`__value_schema_id` / `__key_schema_id`) for the schema ID and fall back to the payload prefix if not found. Once consumers are on the Confluent deserializer, no further config change is needed when producers switch to `HeaderSchemaIdSerializer`.
 
@@ -1493,7 +1492,7 @@ For producers with schemas in code but no Schema Registry integration (Category 
 Replace the serializer with the Confluent JSON serializer + header-based schema ID.
 Payload stays clean JSON. Schema ID goes to Kafka headers. **Non-breaking** for consumers.
 
-> **Minimum versions:** Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
+> **Minimum versions:** Java CP 8.0+, Python v2.10.1+, .NET v2.10.1+, Go v2.10.1+, Node v1.3.2+.
 
 | Current State | Recommended Serializer | Config Changes |
 |--------------|----------------------|----------------|
@@ -1501,7 +1500,7 @@ Payload stays clean JSON. Schema ID goes to Kafka headers. **Non-breaking** for 
 | Java `JsonSerializer` (Spring) | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add Confluent dependency, update serializer class |
 | Python `kafka-python` + `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Replace library, use `SerializingProducer`, set `value.schema.id.serializer` |
 | Python `confluent-kafka` + inline `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Remove inline serialization, set `value.schema.id.serializer` |
-| .NET `JsonConvert` / `System.Text.Json` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` + header mode | Add NuGet (>= 2.13.0), configure header-based schema ID |
+| .NET `JsonConvert` / `System.Text.Json` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` + header mode | Add NuGet (>= 2.10.1), configure header-based schema ID |
 | Go `json.Marshal` before `Produce()` | `confluent-kafka-go` JSON serializer + header mode | Remove manual marshal, add SR client, configure header-based schema ID |
 | Node `kafkajs` + `JSON.stringify` | `@confluentinc/kafka-javascript` with SR + header mode | Replace library, remove inline serialization, configure header-based schema ID |
 | PHP `json_encode` + `php-rdkafka` | `php-rdkafka` with SR integration + header mode | Add SR client, remove inline `json_encode`, configure header-based schema ID |
@@ -1511,7 +1510,7 @@ Payload stays clean JSON. Schema ID goes to Kafka headers. **Non-breaking** for 
 Replace the custom serializer with a Confluent serializer. The payload format changes, so **consumers must be upgraded first** to handle both old and new formats during the transition.
 
 > **Rollout order: consumers first, then producers.**
-> **Minimum versions:** Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
+> **Minimum versions:** Java CP 8.0+, Python v2.10.1+, .NET v2.10.1+, Go v2.10.1+, Node v1.3.2+.
 
 **Step 1 — Upgrade all consumers (before touching producers):**
 
@@ -1553,7 +1552,7 @@ Consumers today read raw JSON and ignore Kafka headers. Safe to upgrade producer
 
 Consumers already use Confluent deserializers. On supported versions, they automatically check headers first for the schema ID and fall back to the payload prefix. **No consumer changes needed** — just verify consumers are on supported versions.
 
-1. **Verify consumer versions** — Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
+1. **Verify consumer versions** — Java CP 8.0+, Python v2.10.1+, .NET v2.10.1+, Go v2.10.1+, Node v1.3.2+.
 2. **Upgrade producers** — add `HeaderSchemaIdSerializer`. Everything else stays the same.
 
 ### Scenario 3: Custom serdes → Confluent serdes (Category E) — Consumers First

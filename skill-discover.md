@@ -777,15 +777,14 @@ For each candidate, create a git-apply-ready patch at `discover/patches/{service
 
 **Language-specific producer code to insert:**
 
-> **Schema Registry integration:** All patches use Confluent serializers with Schema Registry
-> so schemas are validated and registered. For **Java**, `HeaderSchemaIdSerializer` is fully
-> configured — schema ID goes into Kafka headers, keeping payloads clean. For **Python, .NET,
-> and Go**, the Confluent serializer is configured with `auto.register.schemas=false` and
-> `use.latest.version=true`; adding header-based schema ID requires checking your client
-> version's docs (the config property varies by language and version). For **Node/TS and PHP**,
-> schema ID is manually encoded into Kafka headers since native SR serializer support varies.
+> **Schema Registry integration:** All patches use Confluent serializers with Schema Registry.
+> For **JSON format**, Java adds `HeaderSchemaIdSerializer` (schema ID in headers, payload
+> stays clean JSON). Python/Go/.NET use the Confluent JSON serializer which handles SR
+> integration natively. For **Node/TS and PHP**, native SR serializer support is limited;
+> patches use manual JSON serialization with schema ID in headers.
 >
-> **Minimum client versions:** Java 8.1.1+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
+> **Minimum client versions for HeaderSchemaIdSerializer:** Java CP 8.0+, Python v2.10.1+,
+> Go v2.10.1+, .NET v2.10.1+, Node v1.3.2+.
 
 **Java (Spring Kafka + Confluent SR):**
 ```java
@@ -841,37 +840,36 @@ implementation 'io.confluent:kafka-json-schema-serializer:8.2.0'
 
 **Python — required dependency (add to requirements.txt or pyproject.toml):**
 ```
-confluent-kafka[schema-registry]>=2.13.0
+confluent-kafka[schemaregistry,json]>=2.10.1
 ```
 
 **Python (confluent-kafka + SR):**
 ```python
 # Import
-from confluent_kafka import SerializingProducer
+from confluent_kafka import Producer
+from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.json_schema import JSONSerializer
 import os
 
 # Initialization (in __init__ or module level)
-sr_client = SchemaRegistryClient({
+sr_conf = {
     'url': os.environ.get('SCHEMA_REGISTRY_URL', 'http://localhost:8081'),
-    'basic.auth.user.info': f"{os.environ.get('SCHEMA_REGISTRY_API_KEY', '')}:{os.environ.get('SCHEMA_REGISTRY_API_SECRET', '')}"
-})
-# Load schema from file — adjust path to your schema location
+    # For Confluent Cloud:
+    # 'basic.auth.user.info': f"{os.environ.get('SCHEMA_REGISTRY_API_KEY')}:{os.environ.get('SCHEMA_REGISTRY_API_SECRET')}"
+}
+sr_client = SchemaRegistryClient(sr_conf)
+
 schema_path = os.path.join(os.path.dirname(__file__), 'schemas', '{topic}-value.json')
 with open(schema_path) as f:
     schema_str = f.read()
-json_serializer = JSONSerializer(schema_str, sr_client, conf={'auto.register.schemas': False, 'use.latest.version': True})
+json_serializer = JSONSerializer(schema_str, sr_client)
 
-self._kafka_producer = SerializingProducer({
+self._producer = Producer({
     'bootstrap.servers': os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'),
-    'value.serializer': json_serializer,
     'enable.idempotence': True,
     'acks': 'all',
 })
-# Note: For header-based schema ID (HeaderSchemaIdSerializer), check confluent-kafka-python >= 2.13.0
-# docs for the exact configuration property. The Java equivalent is:
-#   value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
 
 self._delivery_error = None
 
@@ -882,15 +880,15 @@ def _delivery_callback(err, msg):
     else:
         logger.debug(f"Produced to {msg.topic()} [{msg.partition()}] @ {msg.offset()}")
 
-# Producer call (after mutation logic) — pass the dict directly, not json.dumps
+# Producer call (after mutation logic) — serialize via SR, not json.dumps
 self._delivery_error = None
-self._kafka_producer.produce(
-    '{topic}',
+self._producer.produce(
+    topic='{topic}',
     key=str({key_expression}),
-    value={event_dict},
+    value=json_serializer({event_dict}, SerializationContext('{topic}', MessageField.VALUE)),
     on_delivery=_delivery_callback,
 )
-self._kafka_producer.flush()
+self._producer.flush()
 if self._delivery_error:
     raise RuntimeError(f"Kafka produce failed: {self._delivery_error}")
 ```
@@ -919,17 +917,13 @@ private readonly ISchemaRegistryClient _srClient;
 //     EnableIdempotence = true,
 //     Acks = Acks.All,
 // };
-// var jsonSerializerConfig = new JsonSerializerConfig
+// var schemaRegistryConfig = new SchemaRegistryConfig
 // {
-//     SubjectNameStrategy = SubjectNameStrategy.Topic,
-//     AutoRegisterSchemas = false,
-//     UseLatestVersion = true,
+//     Url = Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_URL"),
 // };
-// // For header-based schema ID (>= 2.13.0), check the Confluent .NET docs for
-// // SchemaIdLocation configuration. The Java equivalent is:
-// //   value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
+// _srClient = new CachedSchemaRegistryClient(schemaRegistryConfig);
 // _producer = new ProducerBuilder<string, {EventClass}>(producerConfig)
-//     .SetValueSerializer(new JsonSerializer<{EventClass}>(_srClient, jsonSerializerConfig))
+//     .SetValueSerializer(new JsonSerializer<{EventClass}>(_srClient))
 //     .Build();
 
 // Producer call — pass the typed object directly
@@ -952,7 +946,7 @@ catch (ProduceException<string, {EventClass}> ex)
 
 **.NET — required NuGet packages:**
 ```
-Confluent.SchemaRegistry.Serdes.Json >= 2.13.0
+Confluent.SchemaRegistry.Serdes.Json >= 2.10.1
 ```
 
 **Go — required dependency:**
@@ -981,16 +975,8 @@ serializer *jsonschema.Serializer
 //     "enable.idempotence":  true,
 //     "acks":                "all",
 // })
-// srClient, _ := schemaregistry.NewClient(schemaregistry.NewConfigWithAuthentication(
-//     os.Getenv("SCHEMA_REGISTRY_URL"),
-//     os.Getenv("SCHEMA_REGISTRY_API_KEY"),
-//     os.Getenv("SCHEMA_REGISTRY_API_SECRET")))
-// serConfig := jsonschema.NewSerializerConfig()
-// serConfig.AutoRegisterSchemas = false
-// serConfig.UseLatestVersion = true
-// s.serializer, _ = jsonschema.NewSerializer(srClient, serde.ValueSerde, serConfig)
-// Note: For header-based schema ID, check confluent-kafka-go docs for the equivalent
-// of Java's value.schema.id.serializer=HeaderSchemaIdSerializer
+// srClient, _ := schemaregistry.NewClient(schemaregistry.NewConfig(os.Getenv("SCHEMA_REGISTRY_URL")))
+// ser, _ := jsonschema.NewSerializer(srClient, serde.ValueSerde, jsonschema.NewSerializerConfig())
 
 // Producer call — serialize via SR, not json.Marshal
 payload, err := s.serializer.Serialize("{topic}", {eventStruct})
@@ -1016,51 +1002,36 @@ if m.TopicPartition.Error != nil {
 }
 ```
 
+**Node/TS — required dependencies (`package.json`):**
+```json
+{
+  "dependencies": {
+    "@confluentinc/kafka-javascript": "^1.0.0",
+    "@confluentinc/schemaregistry": "^1.0.0"
+  }
+}
+```
+
 **Node/TS (@confluentinc/kafka-javascript + SR):**
 ```typescript
 // Import — use Confluent's client, not kafkajs
-// Note: Verify exact package name and API against the version you install.
-// The @confluentinc/kafka-javascript package API may differ by version.
-import { Kafka, Producer } from '@confluentinc/kafka-javascript';
+import { Kafka } from '@confluentinc/kafka-javascript';
 
-// Fields
-private producer: Producer;
-private schemaId: number;
-
-// Initialization — verify exact API against the @confluentinc/kafka-javascript
-// version you install. The API surface may differ from what's shown below.
-// const kafka = new Kafka({
-//   kafkaJS: {
-//     brokers: [process.env.KAFKA_BROKERS || 'localhost:9092'],
-//     clientId: '{service-name}',
-//   },
-// });
-// this.producer = kafka.producer({
-//   kafkaJS: { acks: -1 },  // acks=all
-//   'enable.idempotence': true,
-// });
+// Initialization
+// const kafka = new Kafka({ brokers: [process.env.KAFKA_BROKERS || 'localhost:9092'] });
+// this.producer = kafka.producer();
 // await this.producer.connect();
-//
-// // Schema ID — resolve once at startup, not per message
-// // After registering via Terraform, look up the numeric ID:
-// const srUrl = process.env.SCHEMA_REGISTRY_URL || 'http://localhost:8081';
-// const srAuth = Buffer.from(`${process.env.SCHEMA_REGISTRY_API_KEY}:${process.env.SCHEMA_REGISTRY_API_SECRET}`).toString('base64');
-// const res = await fetch(`${srUrl}/subjects/{topic}-value/versions/latest`, {
-//   headers: { Authorization: `Basic ${srAuth}` },
-// });
-// const { id } = await res.json();
-// this.schemaId = id;
 
-// Producer call — encode schema ID into header, send clean JSON payload
-const buf = Buffer.alloc(4);
-buf.writeInt32BE(this.schemaId, 0);
+// Producer call — send JSON with schema validation
+// Note: For SR integration with @confluentinc/kafka-javascript, see the
+// Confluent Node.js client docs for the serializer API in your version.
+// The pattern below sends clean JSON; register schemas via Terraform.
 try {
   await this.producer.send({
     topic: '{topic}',
     messages: [{
       key: String({keyExpression}),
       value: JSON.stringify({eventObject}),
-      headers: { '__value_schema_id': buf },
     }],
   });
 } catch (err) {

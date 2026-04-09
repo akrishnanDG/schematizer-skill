@@ -578,7 +578,7 @@ Note: `confluent_tag` resources (PII, PRIVATE, SENSITIVE) are created first auto
 
 ## Upgrade Recommendations (Audit Mode)
 
-> **Minimum versions:** Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
+> **Minimum versions:** Java CP 8.0+, Python v2.10.1+, .NET v2.10.1+, Go v2.10.1+, Node v1.3.2+.
 
 ### Category B — JSON producers without SR
 
@@ -612,10 +612,10 @@ Rollout order: **consumers first**, then producers.
 | Language | Recommended |
 |----------|-------------|
 | Java | Replace with `KafkaAvroSerializer` / `KafkaJsonSchemaSerializer` / `ProtobufSerializer` + `HeaderSchemaIdSerializer` |
-| Python (>= 2.13.0) | Replace with `confluent-kafka` serializer + `header_schema_id_serializer` |
-| .NET (>= 2.13.0) | Replace with `Confluent.SchemaRegistry.Serdes` serializer + header mode |
-| Go (>= 2.13.0) | Replace with `confluent-kafka-go` serializer + header mode |
-| Node (>= 1.8.0) | Replace with `@confluentinc/kafka-javascript` serializer + header mode |
+| Python (>= 2.10.1) | Replace with `confluent-kafka` serializer with SR |
+| .NET (>= 2.10.1) | Replace with `Confluent.SchemaRegistry.Serdes` serializer with SR |
+| Go (>= 2.10.1) | Replace with `confluent-kafka-go` serializer with SR |
+| Node (>= 1.3.2) | Replace with `@confluentinc/kafka-javascript` serializer with SR |
 
 ## Token Usage Estimates
 
