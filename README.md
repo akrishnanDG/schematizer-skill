@@ -259,35 +259,6 @@ For candidates with Risk=Medium or Risk=High, Discover recommends the **outbox p
 
 ---
 
-## Applying the Terraform (Audit Mode)
-
-After reviewing Audit outputs:
-
-```bash
-cd terraform
-
-# If schemas already exist in SR, import them first:
-chmod +x import.sh
-export SCHEMA_REGISTRY_API_KEY=<key>
-export SCHEMA_REGISTRY_API_SECRET=<secret>
-export SCHEMA_REGISTRY_REST_ENDPOINT=<url>
-export SCHEMA_REGISTRY_ID=<cluster-id>
-./import.sh
-
-# Initialize and apply
-terraform init
-
-export TF_VAR_schema_registry_id=lsrc-abc123
-export TF_VAR_schema_registry_rest_endpoint=https://psrc-xxxxx.us-east-1.aws.confluent.cloud
-export TF_VAR_schema_registry_api_key=<key>
-export TF_VAR_schema_registry_api_secret=<secret>
-
-terraform plan
-terraform apply
-```
-
----
-
 ## Applying Discover Patches
 
 After reviewing and approving candidates in `kafka_recommendations.yaml`:

@@ -66,7 +66,7 @@ Search the repo for build/dependency files and check for Kafka libraries.
 | Language | Dependency Strings |
 |----------|-------------------|
 | Java | `spring-kafka`, `kafka-clients`, `kafka-streams`, `spring-cloud-stream`, `io.confluent`, `confluent-kafka` |
-| Python | `confluent-kafka`, `confluent_kafka`, `kafka-python`, `faust-streaming`, `faust` |
+| Python | `confluent-kafka`, `confluent_kafka`, `kafka-python`, `aiokafka`, `faust-streaming`, `faust` |
 | .NET | `Confluent.Kafka`, `Confluent.SchemaRegistry`, `Confluent.SchemaRegistry.Serdes` |
 | Go | `confluent-kafka-go`, `github.com/Shopify/sarama`, `github.com/IBM/sarama`, `github.com/segmentio/kafka-go` |
 | Node/TS | `kafkajs`, `node-rdkafka`, `@confluentinc/kafka-javascript`, `kafka-node` |
@@ -81,7 +81,7 @@ For each app with Kafka dependencies, search source files for producer/consumer 
 | Language | Patterns |
 |----------|----------|
 | Java | `KafkaTemplate`, `KafkaProducer`, `ProducerRecord`, `@SendTo`, `StreamBridge`, `ProducerFactory`, `KStream`, `KTable`, `StreamsBuilder`, `.to(`, `.through(` |
-| Python | `Producer(`, `SerializingProducer(`, `AvroProducer(`, `.produce(`, `send(topic` |
+| Python | `Producer(`, `SerializingProducer(`, `AvroProducer(`, `.produce(`, `send(topic`, `send_and_wait(`, `AIOKafkaProducer(` |
 | .NET | `ProducerBuilder`, `IProducer`, `ProduceAsync`, `.Produce(` |
 | Go | `kafka.NewProducer`, `sarama.NewSyncProducer`, `sarama.NewAsyncProducer`, `kafka.NewWriter` |
 | Node/TS | `producer.send(`, `kafka.producer(`, `producer.produce(`, `.sendBatch(` |
@@ -147,6 +147,7 @@ default.key.serde
 | `SpecificAvroSerde` / `GenericAvroSerde` (Kafka Streams) | AVRO | Yes |
 | `KafkaJsonSchemaSerde` (Kafka Streams) | JSON | Yes |
 | `KafkaProtobufSerde` (Kafka Streams) | PROTOBUF | Yes |
+| `HeaderSchemaIdSerializer` | Determined by companion serializer | Yes (SR integrated, header mode) |
 | `StringSerializer` + JSON data in code | JSON (infer) | No — flag for upgrade |
 | `ByteArraySerializer` + Avro in code | AVRO (infer) | No — flag for upgrade |
 | `JsonSerializer` (Spring default) | JSON (infer) | No — flag for upgrade |
@@ -432,7 +433,7 @@ JsonConverter
 **Classification:**
 - If `value.converter` uses `AvroConverter`/`JsonSchemaConverter`/`ProtobufConverter` with `schema.registry.url` → **Category A** (SR-integrated)
 - If `value.converter` uses `JsonConverter` without SR → **Category B** (JSON, no SR)
-- If `auto.register.schemas` is not set or is `true` (Connect default) → **Category C** (auto-register)
+- If `auto.register.schemas=true` is explicitly set → **Category C**. If the property is absent, check the Connect worker version: Confluent Platform >= 7.x defaults to `false` (Category A), older versions default to `true` (Category C)
 - For Debezium source connectors: the source table DDL defines the schema. Note the `database.server.name`, `table.include.list`, and topic naming pattern (`{server}.{schema}.{table}`)
 - For sink connectors: record them as **consumers** in the app catalog, not producers
 
@@ -526,7 +527,7 @@ Search the repo for existing schema definitions:
 
 ```
 **/*.avsc          (Avro schema)
-**/*.avro          (Avro schema)
+**/*.avro          (Avro binary data — NOT schema; only read header if no .avsc exists)
 **/*.proto         (Protobuf)
 **/schema*.json    (JSON Schema)
 **/*.schema.json   (JSON Schema)
@@ -801,7 +802,7 @@ Look for string joining with delimiters (`,`, `|`, `\t`) near `send()`/`produce(
    - Boolean → `"type": "boolean"`
    - Nested map/dict/object → `"type": "object"` with nested properties
    - List/array → `"type": "array"`
-   - If type is ambiguous (e.g., `Object`, `interface{}`, `any`), default to `"type": "string"` and add a TODO comment
+   - If type is ambiguous (e.g., `Object`, `interface{}`, `any`), use `{}` (any type in JSON Schema) or `"type": "string"` as a fallback, add a `TODO: verify type` comment, and flag in the report as needing manual review
 3. Mark fields as `required` if they are always set (not conditionally)
 4. Tag PII fields using the patterns in section 3.3b
 5. Classify as **Category B** if schema can be inferred, **Category D** if field names cannot be determined (e.g., raw CSV with no header)
@@ -931,7 +932,7 @@ When generating schemas, scan every field name for potential PII and add `conflu
 | `email`, `e_mail`, `email_address`, `emailAddress` | `PII` | user_email, contact_email |
 | `phone`, `phone_number`, `phoneNumber`, `mobile`, `telephone`, `tel` | `PII` | home_phone, mobile_number |
 | `ssn`, `social_security`, `socialSecurity`, `social_security_number` | `PII`, `PRIVATE` | ssn_last4 |
-| `name`, `first_name`, `firstName`, `last_name`, `lastName`, `full_name`, `fullName` | `PII` | customer_name, user_first_name |
+| `first_name`, `firstName`, `last_name`, `lastName`, `full_name`, `fullName`, `customer_name`, `user_name`, `person_name`, `display_name` | `PII` | Note: bare `name` has high false-positive rate (matches `product_name`, `server_name`). Only match `name` when prefixed with person-related terms. |
 | `address`, `street`, `city`, `state`, `zip`, `zip_code`, `zipCode`, `postal_code`, `postalCode` | `PII` | billing_address, shipping_street |
 | `date_of_birth`, `dateOfBirth`, `dob`, `birth_date`, `birthday` | `PII` | customer_dob |
 | `ip`, `ip_address`, `ipAddress`, `client_ip`, `remote_addr` | `PII` | source_ip, request_ip |
@@ -1009,11 +1010,11 @@ Classify each producer into a category based on findings:
 
 | Category | Criteria | Action |
 |----------|----------|--------|
-| **A: Compliant** | Uses Confluent serializer + schema.registry.url configured + no auto.register | Report as compliant. Still extract schema to Terraform if not already managed by IaC. |
+| **A: Compliant** | Uses Confluent serializer + schema.registry.url configured + `auto.register.schemas` is explicitly `false` or absent on client versions where the default is `false` (Java >= 7.x, Python >= 2.0) | Report as compliant. Still extract schema to Terraform if not already managed by IaC. If Terraform files already exist in the repo for these subjects, skip generation. |
 | **A→Header: Already on SR, migrating to headers** | Uses Confluent serializer + SR, wants to move schema ID from payload prefix to Kafka headers | No schema extraction needed. Add `HeaderSchemaIdSerializer` to producers. Consumers need no changes — Confluent deserializers on supported versions automatically check both headers and payload for schema ID. See rollout ordering below. |
 | **B: Schema in code, no SR** | Has data models/classes but uses StringSerializer, JsonSerializer (Spring), kafka-python, kafkajs raw, or no Confluent SR integration | Extract schema → `terraform/schemas.tf` + add upgrade recommendation to report |
 | **C: Auto-register** | Has `auto.register.schemas=true` | Extract schema → `terraform/flagged-auto-register.tf` (commented out) + flag risk in report |
-| **D: No schema** | Raw strings/bytes, no discernible data model, hardcoded JSON strings | Flag in report with recommendation to adopt schema-first approach |
+| **D: No schema** | Raw strings/bytes where field names and types cannot be reliably determined (e.g., raw CSV without headers, binary protocols, obfuscated data). If inline JSON keys are visible and a schema can be inferred per Section 3.2b, classify as Category B instead | Flag in report with recommendation to adopt schema-first approach |
 | **E: Custom serializer** | Implements `Serializer<T>` interface, uses `json.dumps`/`JSON.stringify`/`JsonConvert`/`json.Marshal`/`GenericDatumWriter`/`fastavro`/`proto.Marshal` inline, or has a custom serialization function — all without SR | Extract schema from the data model inside the custom serializer → `terraform/schemas.tf` + recommend replacing with Confluent serializer + `HeaderSchemaIdSerializer`. Consumers must be upgraded first using a composite deserializer pattern (Java). See upgrade rules below. |
 
 ---
@@ -1255,8 +1256,8 @@ Only include tag references in `depends_on` that the schema actually uses. If a 
 ```hcl
   schema_reference {
     name         = "{referenced_type_name}"
-    subject_name = "{referenced_subject}"
-    version      = {version}
+    subject_name = confluent_schema.{referenced_resource}.subject_name
+    version      = confluent_schema.{referenced_resource}.version
   }
 ```
 
@@ -1681,6 +1682,8 @@ on:
       - '**/*.proto'
       - '**/application*.properties'
       - '**/application*.yml'
+      - 'schemas/**'
+      - 'terraform/**/*.tf'
 
 jobs:
   check:
@@ -1694,7 +1697,9 @@ jobs:
             --include="*.properties" --include="*.yml" --include="*.yaml" \
             --include="*.java" --include="*.py" --include="*.cs" \
             --include="*.go" --include="*.ts" --include="*.js" \
-            --include="*.php" .; then
+            --include="*.php" \
+            --exclude-dir=docs --exclude-dir=.git --exclude-dir=node_modules \
+            --exclude="*.md" --exclude="README*" .; then
             echo "::error::auto.register.schemas=true found — register schemas via Terraform"
             exit 1
           fi
@@ -1735,7 +1740,9 @@ Add to the report's Next Steps:
 
 ## Credential Safety
 
-**NEVER include credential values in any output.** When scanning config files (`application.properties`, `.env`, `*.yml`, `*.yaml`), extract ONLY Kafka-related config keys (serializer class, topic name, auto.register setting). Do not copy passwords, API keys, secrets, tokens, or connection strings to any output file (report, schema, Terraform, patches).
+**NEVER include credential values in any output.** When scanning config files (`application.properties`, `.env`, `docker-compose*.yml`, `*.yml`, `*.yaml`, Kubernetes Secret manifests, Helm `values.yaml`, CI/CD variable definitions), extract ONLY Kafka-related config keys (serializer class, topic name, auto.register setting). Do not copy passwords, API keys, secrets, tokens, or connection strings to any output file (report, schema, Terraform, patches).
+
+If `schema.yaml` is generated with placeholder env vars (`${SCHEMA_REGISTRY_API_KEY}`), warn: "Do not replace these placeholders with actual credentials. They are resolved from environment variables at runtime. Add `schema.yaml` to `.gitignore` if it contains real values."
 
 In the report, reference sensitive config by **file path and line number only** — never reproduce the value. Example: "`basic.auth.user.info` configured at `src/main/resources/application.properties:42`" — never "`basic.auth.user.info=AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG`".
 

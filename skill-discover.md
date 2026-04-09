@@ -271,23 +271,25 @@ These are the methods where Kafka producer calls should be inserted — the "wri
 
 **Java — Grep patterns:**
 ```
-public.*void\s+update
-public.*void\s+create
-public.*void\s+delete
-public.*void\s+save
-public.*void\s+process
-public.*void\s+handle
-public.*void\s+publish
-public.*void\s+dispatch
-public.*void\s+submit
-public.*void\s+approve
-public.*void\s+reject
-public.*void\s+cancel
-public.*void\s+send
-public.*\s+complete
-public.*\s+activate
-public.*\s+deactivate
+public\s+\w+\s+update
+public\s+\w+\s+create
+public\s+\w+\s+delete
+public\s+\w+\s+save
+public\s+\w+\s+process
+public\s+\w+\s+handle
+public\s+\w+\s+publish
+public\s+\w+\s+dispatch
+public\s+\w+\s+submit
+public\s+\w+\s+approve
+public\s+\w+\s+reject
+public\s+\w+\s+cancel
+public\s+\w+\s+send
+public\s+\w+\s+complete
+public\s+\w+\s+activate
+public\s+\w+\s+deactivate
 ```
+
+Note: These patterns match any return type (void, entity, DTO, etc.), not just `void`. Many service methods return the updated entity.
 
 Also look for:
 - Methods in `@Service` or `@Component` classes
@@ -431,7 +433,7 @@ Assign points to each candidate based on the signals found:
 |--------|--------|-----------|
 | Class is a DTO/VO/Event/Message (Cat 1) | +3 | Direct schema candidate |
 | Class is a JPA/Doctrine/Django/EF entity | +2 | Domain model, needs change events |
-| Class has state fields (Cat 2) | +2 per state field | State transitions = high-value events |
+| Class has state fields (Cat 2) | +2 per state field (max +8) | State transitions = high-value events. Cap at 4 fields to prevent score domination. |
 | Class has PII fields | +1 | Governance benefit from SR |
 | Service method is a mutation (Cat 3) | +3 | Insertion point for producer |
 | Method calls a repository write (Cat 4) | +2 | Confirms write path |
@@ -531,6 +533,8 @@ Examples:
 
 If the service/repo has an existing topic naming convention (detectable from Audit results or config), follow that convention instead.
 
+**Note on dots in topic names:** Kafka converts dots to underscores in JMX metrics, so `orders.order.created` and `orders_order_created` produce identical metric bean names. This is usually acceptable but can cause metric collisions if both naming styles coexist. If this is a concern, use hyphens instead: `orders-order-created`.
+
 ### D3.3 Event Envelope Fields
 
 Every recommended event should include these standard envelope fields:
@@ -540,7 +544,7 @@ Every recommended event should include these standard envelope fields:
 | `event_id` | string (UUID) | Unique identifier for this event instance |
 | `event_type` | string | Discriminator (matches topic action, e.g., `order.created`) |
 | `event_timestamp` | string (ISO-8601) | When the event occurred |
-| `event_version` | string | Schema version (e.g., `"1.0"`) |
+| `event_version` | string | Business-level payload format version (e.g., `"1.0"`). This is NOT the SR schema version — SR tracks versions automatically. Use this for breaking changes that require consumer logic updates. |
 | `source_service` | string | Service that produced the event |
 
 The remaining fields come from the domain model (Category 1) with PII tagging applied.
@@ -653,7 +657,7 @@ candidates:
 
 ### D4.3 Generate `discover/kafka_schemas.yaml`
 
-Confluent Schema Registry-compatible event stubs for all candidates:
+Event schema stubs for all candidates. **These are planning documents, not registerable schemas.** Convert to actual JSON Schema, Avro, or Protobuf files before registering in SR (run Audit mode on the patched repo to generate registerable schemas and Terraform):
 
 ```yaml
 # Kafka Event Schemas
@@ -725,7 +729,7 @@ Set the `schema_format` field per candidate in `kafka_recommendations.yaml` and 
 
 When a candidate has **Risk: Medium** or **Risk: High** (Phase D3.1), the Kafka produce should be transactionally consistent with the database write. If `kafkaTemplate.send()` or `producer.produce()` is called directly in the service method, a database rollback after a successful Kafka send creates an orphaned event.
 
-**Outbox pattern:** Instead of producing directly, write the event to an `outbox` table in the same database transaction. A separate process (CDC connector or poller) reads the outbox and publishes to Kafka. This guarantees exactly-once delivery relative to the database.
+**Outbox pattern:** Instead of producing directly, write the event to an `outbox` table in the same database transaction. A separate process (CDC connector or poller) reads the outbox and publishes to Kafka. This guarantees at-least-once delivery relative to the database (the CDC connector may re-read rows on restart). For exactly-once semantics, consumers must be idempotent.
 
 **When to recommend the outbox pattern:**
 - The service method is annotated with `@Transactional` (Java) or uses `session.commit()` (Python) or `SaveChanges()` (.NET)
@@ -742,6 +746,8 @@ When a candidate has **Risk: Medium** or **Risk: High** (Phase D3.1), the Kafka 
 - **Django:** Use `transaction.on_commit(lambda: producer.produce(...))` to defer until after commit.
 - **Node/NestJS:** Use the `afterCommit` hook on Sequelize transactions, or implement an outbox table.
 - **Laravel:** Use `DB::afterCommit(fn () => ...)` to produce after the transaction commits.
+- **Go:** Use a callback after `tx.Commit()` succeeds: `if err := tx.Commit(); err == nil { producer.Produce(...) }`. For full outbox: write to an outbox table within the transaction and poll/CDC it separately.
+- **.NET (EF Core):** Use `SaveChangesAsync()` with an interceptor that publishes events after commit, or subscribe to `SavingChanges`/`SavedChanges` events. For full outbox: use the Outbox pattern with a background service polling the outbox table.
 
 For Risk=Medium/High candidates, note the transactional safety concern in `kafka_recommendations.yaml` under `notes` and recommend the appropriate pattern.
 
@@ -790,9 +796,12 @@ private final KafkaTemplate<String, {EventClass}> kafkaTemplate;
 // Add to existing constructor: KafkaTemplate<String, {EventClass}> kafkaTemplate
 // Add to constructor body: this.kafkaTemplate = kafkaTemplate;
 
+// Add to class if no logger exists:
+// private static final Logger log = LoggerFactory.getLogger({ClassName}.class);
+
 // Producer call (at end of mutation method, before return)
 try {
-    kafkaTemplate.send("{topic}", {keyExpression}, {eventObject}).get();
+    kafkaTemplate.send("{topic}", {keyExpression}, {eventObject}).get(10, java.util.concurrent.TimeUnit.SECONDS);
 } catch (Exception e) {
     // TODO: Add DLQ or alerting for failed produces
     log.error("Failed to produce event to {topic}", e);
@@ -848,6 +857,10 @@ sr_client = SchemaRegistryClient({
     'url': os.environ.get('SCHEMA_REGISTRY_URL', 'http://localhost:8081'),
     'basic.auth.user.info': f"{os.environ.get('SCHEMA_REGISTRY_API_KEY', '')}:{os.environ.get('SCHEMA_REGISTRY_API_SECRET', '')}"
 })
+# Load schema from file or define inline — adjust path to your schema location
+schema_path = os.path.join(os.path.dirname(__file__), 'schemas', '{topic}-value.json')
+with open(schema_path) as f:
+    schema_str = f.read()
 json_serializer = JSONSerializer(schema_str, sr_client)
 
 self._kafka_producer = SerializingProducer({
@@ -893,17 +906,34 @@ private readonly ISchemaRegistryClient _srClient;
 //     BasicAuthCredentialsSource = AuthCredentialsSource.UserInfo,
 //     BasicAuthUserInfo = $"{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_KEY")}:{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_SECRET")}"
 // });
-// var jsonSerializerConfig = new JsonSerializerConfig { SubjectNameStrategy = SubjectNameStrategy.Topic };
+// var jsonSerializerConfig = new JsonSerializerConfig
+// {
+//     SubjectNameStrategy = SubjectNameStrategy.Topic,
+//     AutoRegisterSchemas = false,
+//     UseLatestVersion = true,
+// };
+// // Configure header-based schema ID (requires Confluent.SchemaRegistry.Serdes.Json >= 2.13.0)
+// var serializerBuilder = new JsonSerializer<{EventClass}>(_srClient, jsonSerializerConfig);
 // _producer = new ProducerBuilder<string, {EventClass}>(producerConfig)
-//     .SetValueSerializer(new JsonSerializer<{EventClass}>(_srClient, jsonSerializerConfig))
+//     .SetValueSerializer(serializerBuilder)
 //     .Build();
 
 // Producer call — pass the typed object directly
-await _producer.ProduceAsync("{topic}", new Message<string, {EventClass}>
+try
 {
-    Key = {keyExpression},
-    Value = {eventObject}
-});
+    var result = await _producer.ProduceAsync("{topic}", new Message<string, {EventClass}>
+    {
+        Key = {keyExpression},
+        Value = {eventObject}
+    });
+    // TODO: Log result.Offset, result.Partition for observability
+}
+catch (ProduceException<string, {EventClass}> ex)
+{
+    // TODO: Add DLQ or alerting for failed produces
+    _logger.LogError(ex, "Failed to produce event to {topic}");
+    throw;
+}
 ```
 
 **.NET — required NuGet packages:**
@@ -947,13 +977,21 @@ if err != nil {
     return fmt.Errorf("failed to serialize event: %w", err)
 }
 topic := "{topic}"
+deliveryChan := make(chan kafka.Event, 1)
 err = s.producer.Produce(&kafka.Message{
     TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
     Key:            []byte({keyExpression}),
     Value:          payload,
-}, nil)
+}, deliveryChan)
 if err != nil {
-    return fmt.Errorf("failed to produce message: %w", err)
+    return fmt.Errorf("failed to enqueue message: %w", err)
+}
+// Wait for delivery confirmation
+e := <-deliveryChan
+m := e.(*kafka.Message)
+if m.TopicPartition.Error != nil {
+    // TODO: Add DLQ or alerting for failed produces
+    return fmt.Errorf("delivery failed: %w", m.TopicPartition.Error)
 }
 ```
 
@@ -979,20 +1017,30 @@ private registry: SchemaRegistryClient;
 // this.producer = kafka.producer();
 // await this.producer.connect();
 
-// Producer call — register/encode via SR
+// Schema ID — resolve once during initialization, not per message.
+// After registering the schema via Terraform, look up the ID:
+//   const subject = '{topic}-value';
+//   const { id } = await this.registry.getSchemaByVersion(subject, 'latest');
+//   this.schemaId = id;
 // Note: Verify the exact SR client API against the version you install.
-// The @confluentinc/schemaregistry package API may vary by version.
-const subject = '{topic}-value';
-const schema = { type: 'JSON', schema: JSON.stringify({schemaDefinition}) };
-const { id: schemaId } = await this.registry.register(subject, schema);
-await this.producer.send({
-  topic: '{topic}',
-  messages: [{
-    key: String({keyExpression}),
-    value: JSON.stringify({eventObject}),
-    headers: { '__value_schema_id': Buffer.alloc(4).writeInt32BE(schemaId) || Buffer.alloc(4) },
-  }],
-});
+
+// Producer call — encode the schema ID into headers
+const buf = Buffer.alloc(4);
+buf.writeInt32BE(this.schemaId, 0);
+try {
+  await this.producer.send({
+    topic: '{topic}',
+    messages: [{
+      key: String({keyExpression}),
+      value: JSON.stringify({eventObject}),
+      headers: { '__value_schema_id': buf },
+    }],
+  });
+} catch (err) {
+  // TODO: Add DLQ or alerting for failed produces
+  console.error(`Failed to produce to {topic}:`, err);
+  throw err;
+}
 ```
 
 **PHP (rdkafka — no native SR):**
@@ -1019,7 +1067,7 @@ private Producer $kafkaProducer;
 // Producer call — schema ID must be resolved after terraform apply.
 // Replace SCHEMA_ID_PENDING with the numeric ID from:
 //   curl -u "$SR_KEY:$SR_SECRET" "$SR_URL/subjects/{topic}-value/versions/latest" | jq '.id'
-$schemaId = SCHEMA_ID_PENDING; // TODO: Replace with numeric schema ID after registration
+$schemaId = 0; // TODO: Replace with numeric schema ID after terraform apply
 $topic = $this->kafkaProducer->newTopic('{topic}');
 $headers = ['__value_schema_id' => pack('N', $schemaId)];
 $topic->producev(RD_KAFKA_PARTITION_UA, 0, json_encode({eventArray}), {keyExpression}, $headers);

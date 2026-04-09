@@ -25,7 +25,7 @@ Scans repos with **existing** Kafka producers/consumers. Extracts schemas, detec
 
 **Outputs:** `schemas/`, `terraform/`, `schema-report.md`
 
-**How:** Read and follow `skill-audit.md` (Phases 0–7).
+**How:** Read and follow `skill-audit.md` (Phases 0–8).
 
 ### Discover Mode — "Where should you add Kafka?"
 
@@ -45,13 +45,17 @@ Runs both modes and cross-references findings.
 
 **How:**
 
-1. **Run Audit first** — Read and follow `skill-audit.md` (Phases 0–7)
-2. **Pass Audit catalog to Discover** — The app catalog from Audit Phase 1.5 identifies services already producing/consuming Kafka. Pass this context to Discover so it:
-   - Skips services already fully instrumented (Category A)
+1. **Run Audit first** — Read and follow `skill-audit.md` (Phases 0–8)
+2. **Pass Audit catalog to Discover** — After Audit completes, summarize the app catalog (from Phase 1.5) as a structured list: app name, role, topics, category, language. Hold this in your working context. Discover Phase D0.1 also reads `schema-report.md` for this context — use both sources. Pass this context to Discover so it:
+   - Skips services already fully instrumented (Category A — fully compliant with Confluent SR)
    - For partially instrumented services (B/C/D/E), looks for *additional* event candidates not already being produced
    - For un-instrumented services, runs full discovery
 3. **Run Discover** — Read and follow `skill-discover.md` (Phases D0–D5) with the Audit context
 4. **Generate combined summary** — Create `executive-summary.md` linking both reports
+
+**If Audit finds zero Kafka applications:** Skip the executive summary's "Existing Kafka Health" and "Overlap" sections. Proceed directly to Discover — all services are treated as un-instrumented.
+
+**Partial failures:** If Audit fails to complete (e.g., context window exhausted on a large repo), the partial outputs (`schema-report.md`, `schemas/`, `terraform/`) are still usable. Do not run Discover until Audit completes or is explicitly skipped. If Discover fails, Audit outputs remain valid. To resume after interruption: check which output files exist — if `schema-report.md` exists, Audit completed; if `discover-report.md` exists, Discover completed; if `executive-summary.md` is missing, generate it.
 
 ---
 
@@ -59,10 +63,10 @@ Runs both modes and cross-references findings.
 
 When the user's intent is ambiguous, choose the mode based on what the repo contains:
 
-1. **Quick check:** Search for Kafka client libraries in build files (see Audit Phase 1.1)
-2. **If Kafka libraries are found** → Default to **Audit mode**
+1. **Quick check:** Search the root-level build file (if any) for Kafka dependencies. If found, default to Audit. If no root build file exists, check up to 5 service-level build files.
+2. **If Kafka libraries are found in all scanned services** → Default to **Audit mode**
 3. **If no Kafka libraries are found** → Default to **Discover mode**
-4. **If Kafka libraries are found but coverage seems partial** → Suggest **Combined mode**
+4. **If Kafka libraries are found in some but not all services** → Suggest **Combined mode**
 
 Always confirm the mode with the user if uncertain.
 
@@ -76,6 +80,7 @@ Always confirm the mode with the user if uncertain.
   schema-report.md
   schemas/
   terraform/
+    ci/schema-lint.yml
 ```
 
 ### Discover Only
@@ -94,6 +99,7 @@ Always confirm the mode with the user if uncertain.
   schema-report.md
   schemas/
   terraform/
+    ci/schema-lint.yml
   discover-report.md
   discover/
     kafka_recommendations.yaml
