@@ -1313,7 +1313,7 @@ If Category A or C producers already have schemas registered in Schema Registry 
 
 ```hcl
 # For schemas already registered in SR, import them before applying:
-# terraform import confluent_schema.{resource_name} {sr_cluster_id}/{subject_name}/{schema_id}
+# terraform import confluent_schema.{resource_name} {sr_cluster_id}/{subject_name}/latest
 #
 # Required environment variables (same as used by the Confluent provider):
 #   SCHEMA_REGISTRY_API_KEY
@@ -1333,13 +1333,14 @@ Add a `terraform/import.sh` helper script:
 #   SCHEMA_REGISTRY_REST_ENDPOINT
 #   SCHEMA_REGISTRY_ID
 #
-# To find the numeric schema ID for a subject, query the SR REST API:
+# The import ID format is: {sr_cluster_id}/{subject_name}/{schema_version_or_id}
+# To find the latest version number for a subject:
 #   curl -u "$SCHEMA_REGISTRY_API_KEY:$SCHEMA_REGISTRY_API_SECRET" \
 #     "$SCHEMA_REGISTRY_REST_ENDPOINT/subjects/{subject_name}/versions/latest" \
-#     | jq '.id'
+#     | jq '.version'
 
 # {Repeat for each Category A/C schema that is already in SR}
-terraform import confluent_schema.{resource_name} "$SCHEMA_REGISTRY_ID/{subject_name}/{schema_id}"
+terraform import confluent_schema.{resource_name} "$SCHEMA_REGISTRY_ID/{subject_name}/latest"
 ```
 
 ### 6.7 `terraform/outputs.tf`

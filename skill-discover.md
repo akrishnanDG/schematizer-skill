@@ -777,10 +777,13 @@ For each candidate, create a git-apply-ready patch at `discover/patches/{service
 
 **Language-specific producer code to insert:**
 
-> **Schema Registry + HeaderSchemaIdSerializer:** All patches use Confluent serializers
-> with `HeaderSchemaIdSerializer` so the schema ID goes into Kafka headers (not the payload).
-> This keeps payloads clean and enables Schema Registry governance from day one.
-> Existing consumers that parse raw JSON will continue to work — the payload format is unchanged.
+> **Schema Registry integration:** All patches use Confluent serializers with Schema Registry
+> so schemas are validated and registered. For **Java**, `HeaderSchemaIdSerializer` is fully
+> configured — schema ID goes into Kafka headers, keeping payloads clean. For **Python, .NET,
+> and Go**, the Confluent serializer is configured with `auto.register.schemas=false` and
+> `use.latest.version=true`; adding header-based schema ID requires checking your client
+> version's docs (the config property varies by language and version). For **Node/TS and PHP**,
+> schema ID is manually encoded into Kafka headers since native SR serializer support varies.
 >
 > **Minimum client versions:** Java 8.1.1+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+.
 
@@ -1029,10 +1032,12 @@ private schemaId: number;
 // const kafka = new Kafka({
 //   kafkaJS: {
 //     brokers: [process.env.KAFKA_BROKERS || 'localhost:9092'],
+//     clientId: '{service-name}',
 //   },
 // });
 // this.producer = kafka.producer({
 //   kafkaJS: { acks: -1 },  // acks=all
+//   'enable.idempotence': true,
 // });
 // await this.producer.connect();
 //
