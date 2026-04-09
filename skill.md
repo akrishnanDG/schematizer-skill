@@ -189,7 +189,7 @@ Both modes support these languages:
 
 | Language | Build Files | Frameworks |
 |----------|------------|------------|
-| Java | `pom.xml`, `build.gradle` | Spring Kafka, kafka-clients, Kafka Streams |
+| Java / Kotlin / Scala | `pom.xml`, `build.gradle` | Spring Kafka, kafka-clients, Kafka Streams |
 | Python | `requirements.txt`, `pyproject.toml` | confluent-kafka, kafka-python, Pydantic, Django, FastAPI |
 | .NET | `*.csproj` | Confluent.Kafka, EF Core, MediatR |
 | Go | `go.mod` | confluent-kafka-go, sarama, GORM |

@@ -156,7 +156,7 @@ your-repo/
 
 | Language | Build Files | Audit (Existing Kafka) | Discover (New Events) |
 |----------|------------|----------------------|---------------------|
-| Java | pom.xml, build.gradle | KafkaTemplate, KafkaProducer, KStream | JPA entities, Spring services, Lombok DTOs |
+| Java / Kotlin / Scala | pom.xml, build.gradle | KafkaTemplate, KafkaProducer, KStream, Kafka Connect | JPA entities, Spring services, Lombok DTOs |
 | Python | requirements.txt, pyproject.toml | confluent-kafka, kafka-python | Pydantic, Django models, dataclasses |
 | .NET | *.csproj | Confluent.Kafka | EF Core entities, MediatR, records |
 | Go | go.mod | confluent-kafka-go, sarama | Structs with json tags, GORM models |
@@ -186,12 +186,25 @@ Field names are scanned against known patterns and tagged with `confluent:tags`:
 | email, phone, mobile | `PII` |
 | ssn, credit_card, passport | `PII`, `PRIVATE` |
 | name, address, date_of_birth | `PII` |
+| cpf, nino, aadhaar, sin, bsn, national_id | `PII`, `PRIVATE` |
 | salary, gender, medical | `SENSITIVE` |
 | password, secret, api_key | `PRIVATE` |
 
 ### Multi-Schema Topic Detection
 
 When multiple event types flow through the same topic, Audit generates wrapper schemas with `oneOf`/union/`oneof` and `schema_reference` blocks.
+
+### Kafka Connect / Debezium Detection
+
+Detects Kafka Connect connectors (source and sink) by scanning for connector config files and `connector.class` references. Debezium CDC connectors are classified based on their `value.converter` setting (Category A if using AvroConverter with SR, Category C if auto-register).
+
+### Key Schema Detection
+
+Detects typed key serializers (`key.serializer` with Avro/JSON/Protobuf) and extracts key schemas alongside value schemas. Generates `{topic}-key` Terraform resources when the key is not a simple String.
+
+### CI/CD Pipeline Generation
+
+Generates a grep-based GitHub Actions workflow (`terraform/ci/schema-lint.yml`) that blocks PRs introducing `auto.register.schemas=true`, warns on `StringSerializer` for values, and warns on inline serialization patterns.
 
 ---
 
@@ -230,7 +243,7 @@ candidates:
 
 ### Code Patches
 
-Git-apply-ready unified diffs that add Kafka producer code at identified insertion points:
+Git-apply-ready unified diffs that add Kafka producer code at identified insertion points. Patches use **Confluent serializers with Schema Registry + HeaderSchemaIdSerializer** (not raw `json.dumps` / `JSON.stringify`), include **idempotent producer config** and **error handling**, and come with the required dependency additions.
 
 ```bash
 # Review the patch
@@ -239,6 +252,10 @@ cat discover/patches/order-service-kafka-producer.patch
 # Apply it
 git apply discover/patches/order-service-kafka-producer.patch
 ```
+
+### Transactional Safety
+
+For candidates with Risk=Medium or Risk=High, Discover recommends the **outbox pattern** instead of direct `kafkaTemplate.send()` to ensure consistency between database writes and Kafka events. Includes framework-specific guidance (Spring `@TransactionalEventListener`, Django `transaction.on_commit`, Laravel `DB::afterCommit`).
 
 ---
 
@@ -251,9 +268,10 @@ cd terraform
 
 # If schemas already exist in SR, import them first:
 chmod +x import.sh
-export IMPORT_SCHEMA_REGISTRY_API_KEY=<key>
-export IMPORT_SCHEMA_REGISTRY_API_SECRET=<secret>
-export IMPORT_SCHEMA_REGISTRY_REST_ENDPOINT=<url>
+export SCHEMA_REGISTRY_API_KEY=<key>
+export SCHEMA_REGISTRY_API_SECRET=<secret>
+export SCHEMA_REGISTRY_REST_ENDPOINT=<url>
+export SCHEMA_REGISTRY_ID=<cluster-id>
 ./import.sh
 
 # Initialize and apply
@@ -547,8 +565,9 @@ kafka-schema-gate:
 | **Scoring heuristics are not empirically validated** | Discover | The ranking point values are reasonable defaults. Treat confidence levels as suggestions — human review is required (`pending_review`). |
 | **Large repos may exhaust AI context** | Both | Repos with 1000+ files may fill the context window. Scope to specific services/directories. |
 | **Framework coverage gaps** | Discover | Major frameworks covered (Spring, Django, Laravel, NestJS, EF Core). Less common frameworks (Micronaut, Quarkus, Gin, etc.) may need custom patterns. |
-| **PII detection is name-based only** | Both | Fields with non-standard names containing PII will be missed. Fields matching patterns but not containing PII will be falsely tagged. Always review. |
-| **Static analysis only** | Both | No runtime validation. Cannot verify events are useful at runtime or that insertion points are transactionally safe. |
+| **PII detection is name-based only** | Both | Fields with non-standard names containing PII will be missed. Fields matching patterns but not containing PII will be falsely tagged. Includes international identifiers (CPF, NINO, Aadhaar, etc.). Always review. |
+| **Static analysis only** | Both | No runtime validation. Cannot verify events are useful at runtime. Transactional safety guidance (outbox pattern) is provided for Risk=Medium/High candidates. |
+| **PHP has no native SR integration** | Both | PHP rdkafka (librdkafka) cannot use Confluent serializers natively. Patches use manual schema ID header injection. Consider REST Proxy as an alternative. |
 | **Downstream consumers may be unknown** | Discover | In single-service repos, consumers can't be identified from code. Fill in during human review. |
 
 ## Prerequisites
@@ -566,9 +585,10 @@ cd terraform
 
 # If schemas already exist in Schema Registry, import them first:
 chmod +x import.sh
-export IMPORT_SCHEMA_REGISTRY_API_KEY=<key>
-export IMPORT_SCHEMA_REGISTRY_API_SECRET=<secret>
-export IMPORT_SCHEMA_REGISTRY_REST_ENDPOINT=<url>
+export SCHEMA_REGISTRY_API_KEY=<key>
+export SCHEMA_REGISTRY_API_SECRET=<secret>
+export SCHEMA_REGISTRY_REST_ENDPOINT=<url>
+export SCHEMA_REGISTRY_ID=<cluster-id>
 ./import.sh
 
 # Initialize and apply
@@ -583,7 +603,7 @@ terraform plan
 terraform apply
 ```
 
-Note: `confluent_tag` resources (PII, PRIVATE, SENSITIVE) are created first automatically via `depends_on`.
+Note: `confluent_tag` resources (PII, PRIVATE, SENSITIVE) are created first automatically via `depends_on`. The Terraform uses per-resource authentication (`schema_registry_cluster`, `rest_endpoint`, `credentials` blocks) compatible with Confluent provider v2.x. Import scripts require numeric schema IDs — see the generated `import.sh` for the curl command to look them up.
 
 ## Upgrade Recommendations (Audit Mode)
 

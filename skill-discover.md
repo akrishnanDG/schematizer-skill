@@ -547,25 +547,7 @@ The remaining fields come from the domain model (Category 1) with PII tagging ap
 
 ### D3.4 PII Tagging
 
-Apply the same PII detection patterns as the Audit skill. Scan every field name in the candidate schema for potential PII:
-
-| Pattern | Tag | Examples |
-|---------|-----|---------|
-| `email`, `e_mail`, `email_address`, `emailAddress` | `PII` | user_email, contact_email |
-| `phone`, `phone_number`, `phoneNumber`, `mobile`, `tel` | `PII` | home_phone, mobile_number |
-| `ssn`, `social_security`, `social_security_number` | `PII`, `PRIVATE` | ssn_last4 |
-| `name`, `first_name`, `firstName`, `last_name`, `lastName`, `full_name` | `PII` | customer_name |
-| `address`, `street`, `city`, `zip`, `zip_code`, `postal_code` | `PII` | billing_address |
-| `date_of_birth`, `dateOfBirth`, `dob`, `birth_date` | `PII` | customer_dob |
-| `ip`, `ip_address`, `ipAddress`, `client_ip` | `PII` | source_ip |
-| `credit_card`, `creditCard`, `card_number`, `cardNumber`, `pan` | `PII`, `PRIVATE` | payment_card_number |
-| `passport`, `passport_number` | `PII`, `PRIVATE` | |
-| `driver_license`, `license_number` | `PII`, `PRIVATE` | |
-| `account_number`, `bank_account`, `iban`, `routing_number` | `PII`, `PRIVATE` | |
-| `password`, `secret`, `token`, `api_key` | `PRIVATE` | auth_token |
-| `salary`, `income`, `compensation`, `wage` | `SENSITIVE` | annual_salary |
-| `gender`, `sex`, `race`, `ethnicity`, `religion` | `SENSITIVE` | |
-| `medical`, `diagnosis`, `prescription`, `health` | `SENSITIVE`, `PHI` | medical_record |
+Apply the PII detection patterns defined in `skill-audit.md` Phase 3.3b. Scan every field name in the candidate schema for potential PII and add `confluent:tags` (`PII`, `PRIVATE`, `SENSITIVE`, `PHI`) as appropriate. The full pattern table — including international identifiers (CPF, NINO, Aadhaar, etc.) — is maintained in the Audit skill to avoid duplication. Key patterns: `email`, `phone`, `ssn`, `name`, `address`, `dob`, `ip_address`, `credit_card`, `passport`, `account_number`, `salary`, `medical`.
 
 ---
 
@@ -739,6 +721,30 @@ Do **not** hardcode JSON as the schema format. Detect the appropriate format:
 
 Set the `schema_format` field per candidate in `kafka_recommendations.yaml` and `schema_type` in `kafka_schemas.yaml` accordingly.
 
+### Transactional Safety
+
+When a candidate has **Risk: Medium** or **Risk: High** (Phase D3.1), the Kafka produce should be transactionally consistent with the database write. If `kafkaTemplate.send()` or `producer.produce()` is called directly in the service method, a database rollback after a successful Kafka send creates an orphaned event.
+
+**Outbox pattern:** Instead of producing directly, write the event to an `outbox` table in the same database transaction. A separate process (CDC connector or poller) reads the outbox and publishes to Kafka. This guarantees exactly-once delivery relative to the database.
+
+**When to recommend the outbox pattern:**
+- The service method is annotated with `@Transactional` (Java) or uses `session.commit()` (Python) or `SaveChanges()` (.NET)
+- The event represents a state change that MUST be consistent with the database
+- Downstream consumers take irreversible actions based on the event (e.g., sending emails, charging payments)
+
+**When direct produce is acceptable (Risk: Low):**
+- The event is observational/informational (e.g., metrics, analytics, logging)
+- Consumers are idempotent and can tolerate duplicates or missed events
+- The event does not represent a state transition in the source system
+
+**Framework-specific guidance:**
+- **Spring:** Use `@TransactionalEventListener(phase = AFTER_COMMIT)` to produce only after the DB transaction commits. For full outbox: use Debezium Outbox Connector.
+- **Django:** Use `transaction.on_commit(lambda: producer.produce(...))` to defer until after commit.
+- **Node/NestJS:** Use the `afterCommit` hook on Sequelize transactions, or implement an outbox table.
+- **Laravel:** Use `DB::afterCommit(fn () => ...)` to produce after the transaction commits.
+
+For Risk=Medium/High candidates, note the transactional safety concern in `kafka_recommendations.yaml` under `notes` and recommend the appropriate pattern.
+
 ### D4.4 Generate Patch Files
 
 For each candidate, create a git-apply-ready patch at `discover/patches/{service}-kafka-producer.patch`.
@@ -785,7 +791,13 @@ private final KafkaTemplate<String, {EventClass}> kafkaTemplate;
 // Add to constructor body: this.kafkaTemplate = kafkaTemplate;
 
 // Producer call (at end of mutation method, before return)
-kafkaTemplate.send("{topic}", {keyExpression}, {eventObject});
+try {
+    kafkaTemplate.send("{topic}", {keyExpression}, {eventObject}).get();
+} catch (Exception e) {
+    // TODO: Add DLQ or alerting for failed produces
+    log.error("Failed to produce event to {topic}", e);
+    throw new RuntimeException("Kafka produce failed", e);
+}
 ```
 
 **Java — required Spring config (application.properties or application.yml):**
@@ -797,6 +809,8 @@ spring.kafka.producer.properties.basic.auth.user.info=${SCHEMA_REGISTRY_API_KEY}
 spring.kafka.producer.properties.auto.register.schemas=false
 spring.kafka.producer.properties.use.latest.version=true
 spring.kafka.producer.properties.value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
+spring.kafka.producer.properties.enable.idempotence=true
+spring.kafka.producer.properties.acks=all
 ```
 
 **Java — required dependency (add to pom.xml or build.gradle):**
@@ -824,6 +838,8 @@ confluent-kafka[schema-registry]>=2.13.0
 from confluent_kafka import SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.json_schema import JSONSerializer
+# Note: Verify this import path against your confluent-kafka version.
+# The module path may differ in confluent-kafka-python >= 2.13.0.
 from confluent_kafka.schema_registry.schema_id import HeaderSchemaIdSerializer
 import os
 
@@ -838,13 +854,23 @@ self._kafka_producer = SerializingProducer({
     'bootstrap.servers': os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'),
     'value.serializer': json_serializer,
     'value.schema.id.serializer': HeaderSchemaIdSerializer(),
+    'enable.idempotence': True,
+    'acks': 'all',
 })
+
+def _delivery_callback(err, msg):
+    if err is not None:
+        # TODO: Add DLQ or alerting for failed produces
+        logger.error(f"Failed to produce to {msg.topic()}: {err}")
+    else:
+        logger.debug(f"Produced to {msg.topic()} [{msg.partition()}] @ {msg.offset()}")
 
 # Producer call (after mutation logic) — pass the dict directly, not json.dumps
 self._kafka_producer.produce(
     '{topic}',
     key=str({key_expression}),
-    value={event_dict}
+    value={event_dict},
+    on_delivery=_delivery_callback,
 )
 self._kafka_producer.flush()
 ```
@@ -867,8 +893,9 @@ private readonly ISchemaRegistryClient _srClient;
 //     BasicAuthCredentialsSource = AuthCredentialsSource.UserInfo,
 //     BasicAuthUserInfo = $"{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_KEY")}:{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_SECRET")}"
 // });
+// var jsonSerializerConfig = new JsonSerializerConfig { SubjectNameStrategy = SubjectNameStrategy.Topic };
 // _producer = new ProducerBuilder<string, {EventClass}>(producerConfig)
-//     .SetValueSerializer(new JsonSerializer<{EventClass}>(_srClient, schemaRegistryConfig: new SchemaRegistryConfig { SchemaIdLocation = SchemaIdLocation.Header }))
+//     .SetValueSerializer(new JsonSerializer<{EventClass}>(_srClient, jsonSerializerConfig))
 //     .Build();
 
 // Producer call — pass the typed object directly
@@ -886,13 +913,14 @@ Confluent.SchemaRegistry.Serdes.Json >= 2.13.0
 
 **Go — required dependency:**
 ```
-go get github.com/confluentinc/confluent-kafka-go/v2@v2.13.0
+go get github.com/confluentinc/confluent-kafka-go/v2
 ```
 
 **Go (confluent-kafka-go + SR):**
 ```go
 // Import
 import (
+    "fmt"
     "github.com/confluentinc/confluent-kafka-go/v2/kafka"
     "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
     "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
@@ -908,50 +936,73 @@ serializer *jsonschema.Serializer
 //     os.Getenv("SCHEMA_REGISTRY_URL"),
 //     os.Getenv("SCHEMA_REGISTRY_API_KEY"),
 //     os.Getenv("SCHEMA_REGISTRY_API_SECRET")))
-// s.serializer, _ = jsonschema.NewSerializer(srClient, serde.ValueSerde, jsonschema.NewSerializerConfig())
+// serConfig := jsonschema.NewSerializerConfig()
+// serConfig.AutoRegisterSchemas = false
+// serConfig.UseLatestVersion = true
+// s.serializer, _ = jsonschema.NewSerializer(srClient, serde.ValueSerde, serConfig)
 
 // Producer call — serialize via SR, not json.Marshal
-payload, _ := s.serializer.Serialize("{topic}", {eventStruct})
+payload, err := s.serializer.Serialize("{topic}", {eventStruct})
+if err != nil {
+    return fmt.Errorf("failed to serialize event: %w", err)
+}
 topic := "{topic}"
-s.producer.Produce(&kafka.Message{
+err = s.producer.Produce(&kafka.Message{
     TopicPartition: kafka.TopicPartition{Topic: &topic, Partition: kafka.PartitionAny},
     Key:            []byte({keyExpression}),
     Value:          payload,
 }, nil)
+if err != nil {
+    return fmt.Errorf("failed to produce message: %w", err)
+}
 ```
 
 **Node/TS (@confluentinc/kafka-javascript + SR):**
 ```typescript
 // Import — use Confluent's client, not kafkajs
-import { SchemaRegistry, SchemaType } from '@confluentinc/schemaregistry';
+import { SchemaRegistryClient } from '@confluentinc/schemaregistry';
 import { Kafka, Producer } from '@confluentinc/kafka-javascript';
 
 // Fields
 private producer: Producer;
-private registry: SchemaRegistry;
+private registry: SchemaRegistryClient;
 
 // Initialization
-// this.registry = new SchemaRegistry({
-//   host: process.env.SCHEMA_REGISTRY_URL || 'http://localhost:8081',
-//   auth: { username: process.env.SCHEMA_REGISTRY_API_KEY, password: process.env.SCHEMA_REGISTRY_API_SECRET },
+// this.registry = new SchemaRegistryClient({
+//   baseURLs: [process.env.SCHEMA_REGISTRY_URL || 'http://localhost:8081'],
+//   basicAuthCredentials: {
+//     credentialsSource: 'USER_INFO',
+//     userInfo: `${process.env.SCHEMA_REGISTRY_API_KEY}:${process.env.SCHEMA_REGISTRY_API_SECRET}`,
+//   },
 // });
 // const kafka = new Kafka({ brokers: [process.env.KAFKA_BROKERS || 'localhost:9092'] });
 // this.producer = kafka.producer();
 // await this.producer.connect();
 
-// Producer call — encode via SR
-const schemaId = await this.registry.getLatestSchemaId('{topic}-value');
-const encodedValue = await this.registry.encode(schemaId, {eventObject});
+// Producer call — register/encode via SR
+// Note: Verify the exact SR client API against the version you install.
+// The @confluentinc/schemaregistry package API may vary by version.
+const subject = '{topic}-value';
+const schema = { type: 'JSON', schema: JSON.stringify({schemaDefinition}) };
+const { id: schemaId } = await this.registry.register(subject, schema);
 await this.producer.send({
   topic: '{topic}',
   messages: [{
     key: String({keyExpression}),
-    value: encodedValue,
+    value: JSON.stringify({eventObject}),
+    headers: { '__value_schema_id': Buffer.alloc(4).writeInt32BE(schemaId) || Buffer.alloc(4) },
   }],
 });
 ```
 
-**PHP (rdkafka + SR):**
+**PHP (rdkafka — no native SR):**
+
+> **Limitation:** PHP rdkafka (librdkafka) does not have native Schema Registry
+> integration. There is no `KafkaJsonSchemaSerializer` equivalent for PHP.
+> Options: (1) register schemas via Terraform and add the schema ID header manually,
+> (2) use the Confluent REST Proxy as the producer endpoint, or (3) validate
+> payloads against schemas in tests only. The patch below uses option 1.
+
 ```php
 // Use
 use RdKafka\Producer;
@@ -963,15 +1014,14 @@ private Producer $kafkaProducer;
 // Initialization (in constructor)
 // $conf = new Conf();
 // $conf->set('metadata.broker.list', env('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'));
-// $conf->set('schema.registry.url', env('SCHEMA_REGISTRY_URL', 'http://localhost:8081'));
 // $this->kafkaProducer = new Producer($conf);
 
-// Producer call
-// Note: PHP rdkafka does not have native SR integration.
-// Use the Confluent REST Proxy or register schemas via Terraform and
-// manually add the schema ID header. See the Audit report for details.
+// Producer call — schema ID must be resolved after terraform apply.
+// Replace SCHEMA_ID_PENDING with the numeric ID from:
+//   curl -u "$SR_KEY:$SR_SECRET" "$SR_URL/subjects/{topic}-value/versions/latest" | jq '.id'
+$schemaId = SCHEMA_ID_PENDING; // TODO: Replace with numeric schema ID after registration
 $topic = $this->kafkaProducer->newTopic('{topic}');
-$headers = ['__value_schema_id' => pack('N', {schemaId})];
+$headers = ['__value_schema_id' => pack('N', $schemaId)];
 $topic->producev(RD_KAFKA_PARTITION_UA, 0, json_encode({eventArray}), {keyExpression}, $headers);
 $this->kafkaProducer->flush(1000);
 ```
@@ -1043,7 +1093,7 @@ Create a comprehensive report at the repo root:
 **Insertion Point:** `{file}:{line}` — `{methodName}()`
 **Recommended Topic:** `{topic}`
 **Confidence:** {High|Medium|Low} (score: {N})
-**Schema Format:** JSON
+**Schema Format:** {JSON|AVRO|PROTOBUF}
 
 **Business Question:** {What business question does this event answer?}
 

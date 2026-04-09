@@ -92,7 +92,7 @@ For each app with Kafka dependencies, search source files for producer/consumer 
 | Language | Patterns |
 |----------|----------|
 | Java | `@KafkaListener`, `KafkaConsumer`, `ConsumerRecords`, `KafkaMessageListenerContainer`, `ConcurrentMessageListenerContainer` |
-| Python | `Consumer(`, `DeserializingConsumer(`, `AvroConsumer(`, `.subscribe(`, `.poll(` |
+| Python | `Consumer(`, `AvroConsumer(`, `.subscribe(`, `.poll(` |
 | .NET | `ConsumerBuilder`, `IConsumer`, `.Consume(`, `ConsumerConfig` |
 | Go | `kafka.NewConsumer`, `sarama.NewConsumerGroup`, `kafka.NewReader`, `.ReadMessage(` |
 | Node/TS | `consumer.run(`, `kafka.consumer(`, `consumer.subscribe(`, `eachMessage` |
@@ -128,6 +128,13 @@ HeaderSchemaIdSerializer
 schema.registry.url
 SchemaRegistryClient
 CachedSchemaRegistryClient
+SpecificAvroSerde
+GenericAvroSerde
+KafkaJsonSchemaSerde
+KafkaProtobufSerde
+Serdes.serdeFrom
+default.value.serde
+default.key.serde
 ```
 
 **Determine format from serializer:**
@@ -137,11 +144,25 @@ CachedSchemaRegistryClient
 | `KafkaAvroSerializer` / `AvroSerializer` | AVRO | Yes |
 | `KafkaJsonSchemaSerializer` / `JsonSchemaSerializer` | JSON | Yes |
 | `KafkaProtobufSerializer` / `ProtobufSerializer` | PROTOBUF | Yes |
+| `SpecificAvroSerde` / `GenericAvroSerde` (Kafka Streams) | AVRO | Yes |
+| `KafkaJsonSchemaSerde` (Kafka Streams) | JSON | Yes |
+| `KafkaProtobufSerde` (Kafka Streams) | PROTOBUF | Yes |
 | `StringSerializer` + JSON data in code | JSON (infer) | No — flag for upgrade |
 | `ByteArraySerializer` + Avro in code | AVRO (infer) | No — flag for upgrade |
 | `JsonSerializer` (Spring default) | JSON (infer) | No — flag for upgrade |
 | Custom serializer (see 1.4b) | Infer from code | No — flag for upgrade |
 | No serializer / raw produce | JSON (infer) | No — flag for upgrade |
+
+**Kafka Streams note:** Streams apps use Serde classes (not Serializer/Deserializer directly). The `default.value.serde` and `default.key.serde` properties in `application.properties` determine the format. Internal topics (changelog, repartition) inherit the default serde. Do NOT generate Terraform for internal topics — they are auto-created by Kafka Streams. Only extract schemas for source and output topics.
+
+**REST Proxy producers:** If the repo makes HTTP POST calls to `/topics/{topic}` or uses `Content-Type: application/vnd.kafka.json.v2+json` (or similar), these are REST Proxy producers. They do not use Kafka client libraries and will not match the dependency patterns in Phase 1.1. Grep for:
+```
+/topics/
+Content-Type.*vnd.kafka
+kafka-rest
+rest-proxy
+```
+Classify REST Proxy producers the same way as native producers based on the data format of the HTTP body.
 
 ### 1.4b Detect Custom Serializers
 
@@ -381,6 +402,63 @@ resource "confluent_schema" "order_events_dlq_value" {
 }
 ```
 
+### 1.7 Detect Kafka Connect / Debezium Connectors
+
+Kafka Connect connectors are a major source of Kafka producers in enterprise environments. They run outside application code and are often missed by application-level scans.
+
+**Glob patterns:**
+```
+**/connect*.properties
+**/connect*.json
+**/*connector*.json
+**/*connector*.yml
+**/*connector*.yaml
+**/connectors/**
+```
+
+**Grep patterns (in config files and source):**
+```
+connector.class
+io.debezium
+io.confluent.connect
+key.converter
+value.converter
+AvroConverter
+JsonSchemaConverter
+ProtobufConverter
+JsonConverter
+```
+
+**Classification:**
+- If `value.converter` uses `AvroConverter`/`JsonSchemaConverter`/`ProtobufConverter` with `schema.registry.url` → **Category A** (SR-integrated)
+- If `value.converter` uses `JsonConverter` without SR → **Category B** (JSON, no SR)
+- If `auto.register.schemas` is not set or is `true` (Connect default) → **Category C** (auto-register)
+- For Debezium source connectors: the source table DDL defines the schema. Note the `database.server.name`, `table.include.list`, and topic naming pattern (`{server}.{schema}.{table}`)
+- For sink connectors: record them as **consumers** in the app catalog, not producers
+
+Add discovered connectors to the app catalog with `role: connector-source` or `role: connector-sink`.
+
+### 1.8 Detect Key Schemas
+
+Most scans focus on value schemas, but producers with typed keys also need key schemas registered.
+
+**Grep patterns (add to Phase 1.4 scan):**
+```
+key.serializer
+key.deserializer
+KeySerializer
+key-serializer
+key\.serializer
+```
+
+**When to extract key schemas:**
+- If `key.serializer` is `KafkaAvroSerializer`, `KafkaJsonSchemaSerializer`, or `KafkaProtobufSerializer` → extract the key data model
+- If `key.serializer` is `StringSerializer`, `LongSerializer`, `IntegerSerializer`, or `ByteArraySerializer` → no key schema needed
+- In Java: the `K` type in `KafkaTemplate<K, V>` or `ProducerRecord<K, V>` is the key model
+- In Python: check the `key_serializer` parameter in producer config
+
+For each topic with a typed key, generate a `{topic}-key.{ext}` schema file and a corresponding `confluent_schema` Terraform resource with `subject_name = "{topic}-key"`.
+
 ---
 
 ## Phase 2: Risk Detection — `auto.register.schemas=true`
@@ -508,6 +586,20 @@ If no schema files exist, find the data classes/models being serialized and conv
 ### 3.2b Infer from Inline Key-Value Data (No Class/Model)
 
 If a producer sends data as a raw map, dictionary, or inline JSON object — with no typed class — infer the schema from the code that constructs the data.
+
+**Quick reference — what to look for by data construction pattern:**
+
+| Pattern | Languages | What to Extract |
+|---------|-----------|-----------------|
+| HashMap / Map.of / dict literal | Java, Python, Go, Node | Field names from keys, types from values |
+| JSON string construction | All | Field names from JSON keys in the string |
+| JSON tree API (ObjectNode, JsonObject) | Java, .NET | Field names from `.put()` / `.addProperty()` calls |
+| Builder / fluent pattern | Java, Kotlin, Scala | Field names from setter method names |
+| ORM entity forwarding | All | Field names from entity/model class definition |
+| Protobuf builder without SR | Java, Python, Go | Schema from the `.proto` file |
+| CSV / delimited strings | All | Infer from variable names (Category D if ambiguous) |
+
+**Detailed patterns by language follow below.** Read only the sections relevant to the languages found in the repo — do not read all of them upfront.
 
 **Java — HashMap / Map.of / JSONObject:**
 ```
@@ -714,6 +806,18 @@ Look for string joining with delimiters (`,`, `|`, `\t`) near `send()`/`produce(
 4. Tag PII fields using the patterns in section 3.3b
 5. Classify as **Category B** if schema can be inferred, **Category D** if field names cannot be determined (e.g., raw CSV with no header)
 
+### Schema Format Selection (Audit)
+
+When generating schema files from extracted data models, choose the output format:
+
+1. **If the producer already uses a Confluent SR serializer** → match its format (Avro/JSON/Protobuf)
+2. **If existing schema files exist in the repo** (`.avsc`, `.proto`, `.schema.json`) → match that format
+3. **If the producer uses a non-SR serializer** (Category B/E) → use the format of the data being serialized:
+   - `ObjectMapper` / `json.dumps` / `JSON.stringify` / `json_encode` → JSON Schema
+   - `GenericDatumWriter` / `fastavro` / `avro.io` → Avro
+   - `proto.Marshal` / `toByteArray()` / `GeneratedMessageV3` → Protobuf
+4. **If no signal exists** → default to JSON Schema (no code generation needed)
+
 ### 3.3 Convert Data Models to Schemas
 
 For each data model found, generate a schema file. **Tag potential PII fields** with `confluent:tags` (see 3.3b).
@@ -724,8 +828,8 @@ For each data model found, generate a schema file. **Tag potential PII fields** 
 - Add `$schema: "http://json-schema.org/draft-07/schema#"`
 - Add `title` matching the class/model name
 - Add `confluent:tags` to PII fields (see 3.3b)
-- **Add `"additionalProperties": false`** to prevent undeclared fields from bypassing schema validation
 - **Add `"default"` values** on optional properties for schema evolution safety
+- **`additionalProperties`:** Set to `false` only if the subject uses BACKWARD compatibility (SR default). If FORWARD or FULL compatibility is needed, omit `additionalProperties` or set to `true` — otherwise adding new fields in a future version will be rejected as incompatible
 
 Example with PII tags and evolution defaults:
 ```json
@@ -810,8 +914,8 @@ import "confluent/meta.proto";
 
 message Customer {
   string customer_id = 1;
-  string email = 2 [(confluent.field_meta) = { tags: ["PII"] }];
-  string ssn = 3 [(confluent.field_meta) = { tags: ["PII", "PRIVATE"] }];
+  string email = 2 [(confluent.field_meta) = { tags: "PII" }];
+  string ssn = 3 [(confluent.field_meta) = { tags: "PII", tags: "PRIVATE" }];
   double order_total = 4;
 }
 ```
@@ -834,6 +938,7 @@ When generating schemas, scan every field name for potential PII and add `conflu
 | `credit_card`, `creditCard`, `card_number`, `cardNumber`, `ccn`, `pan` | `PII`, `PRIVATE` | payment_card_number |
 | `passport`, `passport_number`, `passportNumber` | `PII`, `PRIVATE` | |
 | `driver_license`, `driverLicense`, `license_number` | `PII`, `PRIVATE` | |
+| `cpf`, `cnpj` (Brazil), `nino` (UK), `aadhaar` (India), `sin` (Canada), `bsn` (Netherlands), `curp` (Mexico), `national_id`, `govt_id`, `tax_id` | `PII`, `PRIVATE` | international identifiers |
 | `account_number`, `accountNumber`, `bank_account`, `iban`, `routing_number` | `PII`, `PRIVATE` | |
 | `password`, `secret`, `token`, `api_key`, `apiKey` | `PRIVATE` | auth_token, access_key |
 | `salary`, `income`, `compensation`, `wage` | `SENSITIVE` | annual_salary |
@@ -854,7 +959,7 @@ When generating schemas, scan every field name for potential PII and add `conflu
 
 - **Avro:** Add `"confluent:tags": ["PII"]` as a sibling to `name` and `type` on the field
 - **JSON Schema:** Add `"confluent:tags": ["PII"]` as a sibling to `type` on the property
-- **Protobuf:** Add `[(confluent.field_meta) = { tags: ["PII"] }]` after the field number; for multiple tags use `[(confluent.field_meta) = { tags: ["PII", "PRIVATE"] }]`; must import `confluent/meta.proto`
+- **Protobuf:** Add `[(confluent.field_meta) = { tags: "PII" }]` after the field number; for multiple tags use `[(confluent.field_meta) = { tags: "PII", tags: "PRIVATE" }]`; must import `confluent/meta.proto`
 
 **Report PII findings:** In the report, add a PII summary table showing all tagged fields, their schemas, and the tags applied. This gives teams visibility into what PII is flowing through Kafka.
 
@@ -977,6 +1082,19 @@ Call schema_validate with:
 - Skip automated lint/validate
 - Add to report: "⚠ Schemas were not lint-checked or compatibility-validated. Before registering, install the schema-registry MCP server and run `schema_lint` + `schema_validate`, or manually validate using the Confluent Schema Registry REST API."
 
+### 5.5 Schema Compatibility Mode
+
+Include a compatibility mode recommendation for each subject in the report. The compatibility mode determines which schema changes are allowed without breaking consumers.
+
+| Mode | When to Use |
+|------|-------------|
+| **BACKWARD** (SR default) | Consumers are upgraded before producers. New schema can read old data. Safe to add optional fields with defaults. |
+| **FORWARD** | Producers are upgraded before consumers. Old schema can read new data. Safe to remove optional fields. Do NOT use `additionalProperties: false` with JSON Schema. |
+| **FULL** | Both directions. Most restrictive — only additive changes with defaults. |
+| **NONE** | No compatibility checking. Use only for development/testing. |
+
+Default to BACKWARD unless the user specifies otherwise. Note the recommendation in the Terraform resource as a comment. Compatibility mode is set per-subject in Schema Registry, not in the Terraform `confluent_schema` resource directly — it is configured via `confluent_subject_config` if needed.
+
 ---
 
 ## Phase 6: Generate Terraform
@@ -995,12 +1113,15 @@ terraform {
   }
 }
 
-provider "confluent" {
-  schema_registry_id            = var.schema_registry_id
-  schema_registry_rest_endpoint = var.schema_registry_rest_endpoint
-  schema_registry_api_key       = var.schema_registry_api_key
-  schema_registry_api_secret    = var.schema_registry_api_secret
-}
+# The Confluent provider v2.x uses per-resource authentication.
+# Schema Registry credentials are set on each resource via
+# schema_registry_cluster, rest_endpoint, and credentials blocks.
+# Alternatively, set these environment variables and omit the blocks:
+#   SCHEMA_REGISTRY_ID
+#   SCHEMA_REGISTRY_REST_ENDPOINT
+#   SCHEMA_REGISTRY_API_KEY
+#   SCHEMA_REGISTRY_API_SECRET
+provider "confluent" {}
 ```
 
 ### 6.2 `terraform/variables.tf`
@@ -1040,16 +1161,43 @@ variable "schema_registry_api_secret" {
 # ──────────────────────────────────────────────
 
 resource "confluent_tag" "pii" {
+  schema_registry_cluster {
+    id = var.schema_registry_id
+  }
+  rest_endpoint = var.schema_registry_rest_endpoint
+  credentials {
+    key    = var.schema_registry_api_key
+    secret = var.schema_registry_api_secret
+  }
+
   name        = "PII"
   description = "Personally Identifiable Information — can identify an individual"
 }
 
 resource "confluent_tag" "private" {
+  schema_registry_cluster {
+    id = var.schema_registry_id
+  }
+  rest_endpoint = var.schema_registry_rest_endpoint
+  credentials {
+    key    = var.schema_registry_api_key
+    secret = var.schema_registry_api_secret
+  }
+
   name        = "PRIVATE"
   description = "Highly sensitive data — should be encrypted or masked"
 }
 
 resource "confluent_tag" "sensitive" {
+  schema_registry_cluster {
+    id = var.schema_registry_id
+  }
+  rest_endpoint = var.schema_registry_rest_endpoint
+  credentials {
+    key    = var.schema_registry_api_key
+    secret = var.schema_registry_api_secret
+  }
+
   name        = "SENSITIVE"
   description = "Sensitive information that requires restricted access"
 }
@@ -1071,6 +1219,15 @@ For each Category A, B, and E producer, generate a `confluent_schema` resource. 
 # Category: {A, B, or E}
 # ──────────────────────────────────────────────
 resource "confluent_schema" "{sanitized_topic_name}_value" {
+  schema_registry_cluster {
+    id = var.schema_registry_id
+  }
+  rest_endpoint = var.schema_registry_rest_endpoint
+  credentials {
+    key    = var.schema_registry_api_key
+    secret = var.schema_registry_api_secret
+  }
+
   subject_name = "{topic_name}-value"
   format       = "{AVRO|JSON|PROTOBUF}"
   schema       = file("../schemas/{format_dir}/{topic_name}-value.{ext}")
@@ -1086,9 +1243,12 @@ resource "confluent_schema" "{sanitized_topic_name}_value" {
 Only include tag references in `depends_on` that the schema actually uses. If a schema has no PII fields, the `depends_on` can be omitted.
 
 **Resource naming rules:**
-- Replace dots, hyphens, and special characters with underscores
+- Replace all non-alphanumeric characters with underscores
+- If the result starts with a digit, prefix with `schema_` (Terraform identifiers cannot start with digits)
+- Lowercase the entire name
 - Prefix with format if multiple formats exist for same topic
 - Add `_value` or `_key` suffix
+- Examples: `order-events` → `order_events_value`, `3PL.events` → `schema_3pl_events_value`
 
 **Schema references:** If a schema references another (e.g., Avro union types, Protobuf imports), add `schema_reference` blocks:
 
@@ -1127,6 +1287,15 @@ For each Category C producer, generate **commented-out** resources:
 # auto.register.schemas=true found at: {file}:{line}
 # ──────────────────────────────────────────────
 # resource "confluent_schema" "{sanitized_topic_name}_value" {
+#   schema_registry_cluster {
+#     id = var.schema_registry_id
+#   }
+#   rest_endpoint = var.schema_registry_rest_endpoint
+#   credentials {
+#     key    = var.schema_registry_api_key
+#     secret = var.schema_registry_api_secret
+#   }
+#
 #   subject_name = "{topic_name}-value"
 #   format       = "{AVRO|JSON|PROTOBUF}"
 #   schema       = file("../schemas/{format_dir}/{topic_name}-value.{ext}")
@@ -1143,7 +1312,7 @@ If Category A or C producers already have schemas registered in Schema Registry 
 
 ```hcl
 # For schemas already registered in SR, import them before applying:
-# terraform import confluent_schema.{resource_name} {sr_cluster_id}/{subject_name}/latest
+# terraform import confluent_schema.{resource_name} {sr_cluster_id}/{subject_name}/{schema_id}
 #
 # Required environment variables:
 #   IMPORT_SCHEMA_REGISTRY_API_KEY
@@ -1157,12 +1326,18 @@ Add a `terraform/import.sh` helper script:
 #!/bin/bash
 # Import existing schemas from Schema Registry into Terraform state.
 # Set these environment variables before running:
-#   IMPORT_SCHEMA_REGISTRY_API_KEY
-#   IMPORT_SCHEMA_REGISTRY_API_SECRET
-#   IMPORT_SCHEMA_REGISTRY_REST_ENDPOINT
+#   SCHEMA_REGISTRY_API_KEY
+#   SCHEMA_REGISTRY_API_SECRET
+#   SCHEMA_REGISTRY_REST_ENDPOINT
+#   SCHEMA_REGISTRY_ID
+#
+# To find the numeric schema ID for a subject, query the SR REST API:
+#   curl -u "$SCHEMA_REGISTRY_API_KEY:$SCHEMA_REGISTRY_API_SECRET" \
+#     "$SCHEMA_REGISTRY_REST_ENDPOINT/subjects/{subject_name}/versions/latest" \
+#     | jq '.id'
 
 # {Repeat for each Category A/C schema that is already in SR}
-terraform import confluent_schema.{resource_name} "{sr_cluster_id}/{subject_name}/latest"
+terraform import confluent_schema.{resource_name} "$SCHEMA_REGISTRY_ID/{subject_name}/{schema_id}"
 ```
 
 ### 6.7 `terraform/outputs.tf`
@@ -1321,8 +1496,8 @@ Payload stays clean JSON. Schema ID goes to Kafka headers. **Non-breaking** for 
 |--------------|----------------------|----------------|
 | Java `StringSerializer` + JSON | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add `value.serializer`, `schema.registry.url`, `value.schema.id.serializer` |
 | Java `JsonSerializer` (Spring) | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | Add Confluent dependency, update serializer class |
-| Python `kafka-python` + `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Replace library, use `SerializingProducer`, set `schema.id.serializer` |
-| Python `confluent-kafka` + inline `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Remove inline serialization, set `schema.id.serializer` |
+| Python `kafka-python` + `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Replace library, use `SerializingProducer`, set `value.schema.id.serializer` |
+| Python `confluent-kafka` + inline `json.dumps` | `confluent-kafka` `JSONSerializer` + `header_schema_id_serializer` | Remove inline serialization, set `value.schema.id.serializer` |
 | .NET `JsonConvert` / `System.Text.Json` | `Confluent.SchemaRegistry.Serdes.Json.JsonSerializer<T>` + header mode | Add NuGet (>= 2.13.0), configure header-based schema ID |
 | Go `json.Marshal` before `Produce()` | `confluent-kafka-go` JSON serializer + header mode | Remove manual marshal, add SR client, configure header-based schema ID |
 | Node `kafkajs` + `JSON.stringify` | `@confluentinc/kafka-javascript` with SR + header mode | Replace library, remove inline serialization, configure header-based schema ID |
@@ -1350,7 +1525,7 @@ Replace the custom serializer with the Confluent serializer for the chosen forma
 | Language | Recommended Serializer | Config |
 |----------|----------------------|--------|
 | Java | `KafkaAvroSerializer` / `ProtobufSerializer` / `KafkaJsonSchemaSerializer` | Set `value.serializer`, `schema.registry.url`, `value.schema.id.serializer=HeaderSchemaIdSerializer` |
-| Python | `confluent-kafka` `AvroSerializer` / `ProtobufSerializer` / `JSONSerializer` | Use `SerializingProducer`, set `schema.id.serializer` |
+| Python | `confluent-kafka` `AvroSerializer` / `ProtobufSerializer` / `JSONSerializer` | Use `SerializingProducer`, set `value.schema.id.serializer` |
 | .NET | `Confluent.SchemaRegistry.Serdes` serializer + header mode | Add NuGet, configure header-based schema ID |
 | Go | `confluent-kafka-go` serializer + header mode | Add SR client, configure header-based schema ID |
 | Node | `@confluentinc/kafka-javascript` with SR + header mode | Replace library, configure header-based schema ID |
@@ -1479,6 +1654,95 @@ Topics where serializer changes may affect consumers:
 
 ---
 
+## Phase 8: Generate CI/CD Schema Gate
+
+Generate a CI/CD pipeline config that blocks PRs introducing Kafka schema risks. This uses grep-based checks only — no external tool dependencies.
+
+### 8.1 `terraform/ci/schema-lint.yml` (GitHub Actions)
+
+```yaml
+name: Kafka Schema Lint
+on:
+  pull_request:
+    paths:
+      - '**/pom.xml'
+      - '**/build.gradle'
+      - '**/build.gradle.kts'
+      - '**/package.json'
+      - '**/composer.json'
+      - '**/go.mod'
+      - '**/*.csproj'
+      - '**/requirements.txt'
+      - '**/pyproject.toml'
+      - '**/*Producer*'
+      - '**/*Serializer*'
+      - '**/*kafka*'
+      - '**/*.avsc'
+      - '**/*.proto'
+      - '**/application*.properties'
+      - '**/application*.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Block auto.register.schemas=true
+        run: |
+          if grep -ri "auto.register.schemas.*true" \
+            --include="*.properties" --include="*.yml" --include="*.yaml" \
+            --include="*.java" --include="*.py" --include="*.cs" \
+            --include="*.go" --include="*.ts" --include="*.js" \
+            --include="*.php" .; then
+            echo "::error::auto.register.schemas=true found — register schemas via Terraform"
+            exit 1
+          fi
+
+      - name: Warn on StringSerializer for values
+        run: |
+          if grep -ri "value.serializer.*StringSerializer\|value-serializer.*StringSerializer" \
+            --include="*.properties" --include="*.yml" --include="*.java" .; then
+            echo "::warning::StringSerializer for values — use KafkaJsonSchemaSerializer + HeaderSchemaIdSerializer"
+          fi
+
+      - name: Warn on inline serialization
+        run: |
+          grep -rn "json\.dumps.*produce\|json\.dumps.*send" --include="*.py" . 2>/dev/null && \
+            echo "::warning::Inline json.dumps in Kafka produce — use confluent-kafka serializer" || true
+          grep -rn "JSON\.stringify.*send\|JSON\.stringify.*produce" --include="*.ts" --include="*.js" . 2>/dev/null && \
+            echo "::warning::Inline JSON.stringify in Kafka send — use Confluent serializer" || true
+          grep -rn "json_encode.*produce" --include="*.php" . 2>/dev/null && \
+            echo "::warning::Inline json_encode in Kafka produce — use SR integration" || true
+
+      - name: Terraform plan (if Terraform exists)
+        if: hashFiles('terraform/*.tf') != ''
+        run: |
+          cd terraform
+          terraform init -backend=false
+          terraform validate
+```
+
+### 8.2 Include in Report
+
+Add to the report's Next Steps:
+
+```markdown
+10. [ ] Copy `terraform/ci/schema-lint.yml` to `.github/workflows/` to enable PR-level schema linting
+```
+
+---
+
+## Credential Safety
+
+**NEVER include credential values in any output.** When scanning config files (`application.properties`, `.env`, `*.yml`, `*.yaml`), extract ONLY Kafka-related config keys (serializer class, topic name, auto.register setting). Do not copy passwords, API keys, secrets, tokens, or connection strings to any output file (report, schema, Terraform, patches).
+
+In the report, reference sensitive config by **file path and line number only** — never reproduce the value. Example: "`basic.auth.user.info` configured at `src/main/resources/application.properties:42`" — never "`basic.auth.user.info=AKIAIOSFODNN7EXAMPLE:wJalrXUtnFEMI/K7MDENG`".
+
+If generating CI/CD pipelines that post reports as PR comments, the report should contain no credential values. If in doubt, omit the value and note "credential configured" instead.
+
+---
+
 ## Execution Notes
 
 ### Tool Usage
@@ -1523,9 +1787,11 @@ If MCP tools are not available, the skill still works — it just skips automate
 
 ### Edge Cases
 
-- **Monorepos:** Treat each service/module with its own Kafka dependencies as a separate app
+- **Monorepos (large):** For repos with 20+ services, process in batches. First scan all build files and rank services by Kafka signal density (most grep hits first). Process the top 10 services, generate partial outputs, then ask the user if they want to continue with remaining services. For Combined mode, skip Discover on services that Audit classified as Category A (fully compliant)
+- **Monorepos (general):** Treat each service/module with its own Kafka dependencies as a separate app
 - **Multi-topic producers:** Generate one schema resource per topic
-- **Shared schemas:** If multiple producers use the same data model for different topics, create one schema file and reference it from multiple Terraform resources
-- **No topics found:** If topic names are loaded from environment variables or external config and cannot be determined statically, note this in the report and use placeholder names with a TODO
+- **Shared schemas:** If multiple producers use the same data model for different topics, create one schema file and reference it from multiple Terraform resources. "Same data model" means the same fully-qualified class (Java/Go/.NET) or same module-level class name (Python/Node/PHP). Two different classes with identical fields are separate schemas — note the duplication in the report
+- **No topics found:** If topic names are loaded from environment variables or external config and cannot be determined statically, use `TODO-{APP_NAME}-topic-{N}` as the placeholder topic name. In Terraform, add `# TODO: Replace with actual topic name from environment variable {VAR_NAME}`. In the report, add a "Dynamic Topics" section listing each placeholder and the config source it should be resolved from
 - **Test code:** Skip test directories (`**/test/**`, `**/tests/**`, `**/__tests__/**`, `**/src/test/**`) unless they contain the only schema/model definitions
-- **Multiple serializers per app:** If an app produces to multiple topics with different formats, create separate schema files and Terraform resources for each
+- **Multiple serializers per app:** If an app produces to multiple topics with different formats, create separate schema files and Terraform resources for each. If an app has different serializers for different topics, assign a category per `(app, topic)` pair. The app-level category in the summary table should be the worst category (E > D > C > B > A)
+- **Unsupported languages (Rust, Ruby, Elixir, etc.):** If the repo contains Kafka usage in languages not listed above, note the unsupported language in the report. Apply the closest supported language's patterns (Kotlin/Scala → Java, Ruby → Python). Mark all findings from unsupported languages as "Low confidence — manual verification required"
