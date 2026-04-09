@@ -31,4 +31,4 @@ Generate a full report with upgrade recommendations.
 - [ ] Recommendation: add HeaderSchemaIdSerializer only
 - [ ] Consumer action: "None" — automatic dual-read handles it
 - [ ] Rollout order is "Producers only"
-- [ ] Verify consumer version >= 8.1.1 mentioned
+- [ ] Verify consumer version >= CP 8.0 mentioned

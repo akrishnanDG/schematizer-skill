@@ -41,4 +41,4 @@ Generate schemas, Terraform, and a full report.
 - [ ] PII field `customer_email` tagged in both schemas
 - [ ] Terraform has `confluent_schema` with `schema_reference` for wrapper
 - [ ] Report includes "Producers first" rollout ordering
-- [ ] Version numbers: Java 8.1.1+, C/C++ 0.1.0+, Python 2.13.0+, .NET 2.13.0+, Go 2.13.0+, Node 1.8.0+
+- [ ] Version numbers: Java CP 8.0+, Python v2.10.1+, .NET v2.10.1+, Go v2.10.1+, Node v1.3.2+
