@@ -847,9 +847,6 @@ confluent-kafka[schema-registry]>=2.13.0
 from confluent_kafka import SerializingProducer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.json_schema import JSONSerializer
-# Note: Verify this import path against your confluent-kafka version.
-# The module path may differ in confluent-kafka-python >= 2.13.0.
-from confluent_kafka.schema_registry.schema_id import HeaderSchemaIdSerializer
 import os
 
 # Initialization (in __init__ or module level)
@@ -857,28 +854,33 @@ sr_client = SchemaRegistryClient({
     'url': os.environ.get('SCHEMA_REGISTRY_URL', 'http://localhost:8081'),
     'basic.auth.user.info': f"{os.environ.get('SCHEMA_REGISTRY_API_KEY', '')}:{os.environ.get('SCHEMA_REGISTRY_API_SECRET', '')}"
 })
-# Load schema from file or define inline — adjust path to your schema location
+# Load schema from file — adjust path to your schema location
 schema_path = os.path.join(os.path.dirname(__file__), 'schemas', '{topic}-value.json')
 with open(schema_path) as f:
     schema_str = f.read()
-json_serializer = JSONSerializer(schema_str, sr_client)
+json_serializer = JSONSerializer(schema_str, sr_client, conf={'auto.register.schemas': False, 'use.latest.version': True})
 
 self._kafka_producer = SerializingProducer({
     'bootstrap.servers': os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'),
     'value.serializer': json_serializer,
-    'value.schema.id.serializer': HeaderSchemaIdSerializer(),
     'enable.idempotence': True,
     'acks': 'all',
 })
+# Note: For header-based schema ID (HeaderSchemaIdSerializer), check confluent-kafka-python >= 2.13.0
+# docs for the exact configuration property. The Java equivalent is:
+#   value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
+
+self._delivery_error = None
 
 def _delivery_callback(err, msg):
     if err is not None:
-        # TODO: Add DLQ or alerting for failed produces
+        self._delivery_error = err
         logger.error(f"Failed to produce to {msg.topic()}: {err}")
     else:
         logger.debug(f"Produced to {msg.topic()} [{msg.partition()}] @ {msg.offset()}")
 
 # Producer call (after mutation logic) — pass the dict directly, not json.dumps
+self._delivery_error = None
 self._kafka_producer.produce(
     '{topic}',
     key=str({key_expression}),
@@ -886,6 +888,8 @@ self._kafka_producer.produce(
     on_delivery=_delivery_callback,
 )
 self._kafka_producer.flush()
+if self._delivery_error:
+    raise RuntimeError(f"Kafka produce failed: {self._delivery_error}")
 ```
 
 **.NET (Confluent.Kafka + SR):**
@@ -906,16 +910,23 @@ private readonly ISchemaRegistryClient _srClient;
 //     BasicAuthCredentialsSource = AuthCredentialsSource.UserInfo,
 //     BasicAuthUserInfo = $"{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_KEY")}:{Environment.GetEnvironmentVariable("SCHEMA_REGISTRY_API_SECRET")}"
 // });
+// var producerConfig = new ProducerConfig
+// {
+//     BootstrapServers = Environment.GetEnvironmentVariable("KAFKA_BOOTSTRAP_SERVERS"),
+//     EnableIdempotence = true,
+//     Acks = Acks.All,
+// };
 // var jsonSerializerConfig = new JsonSerializerConfig
 // {
 //     SubjectNameStrategy = SubjectNameStrategy.Topic,
 //     AutoRegisterSchemas = false,
 //     UseLatestVersion = true,
 // };
-// // Configure header-based schema ID (requires Confluent.SchemaRegistry.Serdes.Json >= 2.13.0)
-// var serializerBuilder = new JsonSerializer<{EventClass}>(_srClient, jsonSerializerConfig);
+// // For header-based schema ID (>= 2.13.0), check the Confluent .NET docs for
+// // SchemaIdLocation configuration. The Java equivalent is:
+// //   value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer
 // _producer = new ProducerBuilder<string, {EventClass}>(producerConfig)
-//     .SetValueSerializer(serializerBuilder)
+//     .SetValueSerializer(new JsonSerializer<{EventClass}>(_srClient, jsonSerializerConfig))
 //     .Build();
 
 // Producer call — pass the typed object directly
@@ -962,6 +973,11 @@ producer   *kafka.Producer
 serializer *jsonschema.Serializer
 
 // Initialization
+// producer, _ := kafka.NewProducer(&kafka.ConfigMap{
+//     "bootstrap.servers":   os.Getenv("KAFKA_BOOTSTRAP_SERVERS"),
+//     "enable.idempotence":  true,
+//     "acks":                "all",
+// })
 // srClient, _ := schemaregistry.NewClient(schemaregistry.NewConfigWithAuthentication(
 //     os.Getenv("SCHEMA_REGISTRY_URL"),
 //     os.Getenv("SCHEMA_REGISTRY_API_KEY"),
@@ -970,6 +986,8 @@ serializer *jsonschema.Serializer
 // serConfig.AutoRegisterSchemas = false
 // serConfig.UseLatestVersion = true
 // s.serializer, _ = jsonschema.NewSerializer(srClient, serde.ValueSerde, serConfig)
+// Note: For header-based schema ID, check confluent-kafka-go docs for the equivalent
+// of Java's value.schema.id.serializer=HeaderSchemaIdSerializer
 
 // Producer call — serialize via SR, not json.Marshal
 payload, err := s.serializer.Serialize("{topic}", {eventStruct})
@@ -998,33 +1016,37 @@ if m.TopicPartition.Error != nil {
 **Node/TS (@confluentinc/kafka-javascript + SR):**
 ```typescript
 // Import — use Confluent's client, not kafkajs
-import { SchemaRegistryClient } from '@confluentinc/schemaregistry';
+// Note: Verify exact package name and API against the version you install.
+// The @confluentinc/kafka-javascript package API may differ by version.
 import { Kafka, Producer } from '@confluentinc/kafka-javascript';
 
 // Fields
 private producer: Producer;
-private registry: SchemaRegistryClient;
+private schemaId: number;
 
-// Initialization
-// this.registry = new SchemaRegistryClient({
-//   baseURLs: [process.env.SCHEMA_REGISTRY_URL || 'http://localhost:8081'],
-//   basicAuthCredentials: {
-//     credentialsSource: 'USER_INFO',
-//     userInfo: `${process.env.SCHEMA_REGISTRY_API_KEY}:${process.env.SCHEMA_REGISTRY_API_SECRET}`,
+// Initialization — verify exact API against the @confluentinc/kafka-javascript
+// version you install. The API surface may differ from what's shown below.
+// const kafka = new Kafka({
+//   kafkaJS: {
+//     brokers: [process.env.KAFKA_BROKERS || 'localhost:9092'],
 //   },
 // });
-// const kafka = new Kafka({ brokers: [process.env.KAFKA_BROKERS || 'localhost:9092'] });
-// this.producer = kafka.producer();
+// this.producer = kafka.producer({
+//   kafkaJS: { acks: -1 },  // acks=all
+// });
 // await this.producer.connect();
+//
+// // Schema ID — resolve once at startup, not per message
+// // After registering via Terraform, look up the numeric ID:
+// const srUrl = process.env.SCHEMA_REGISTRY_URL || 'http://localhost:8081';
+// const srAuth = Buffer.from(`${process.env.SCHEMA_REGISTRY_API_KEY}:${process.env.SCHEMA_REGISTRY_API_SECRET}`).toString('base64');
+// const res = await fetch(`${srUrl}/subjects/{topic}-value/versions/latest`, {
+//   headers: { Authorization: `Basic ${srAuth}` },
+// });
+// const { id } = await res.json();
+// this.schemaId = id;
 
-// Schema ID — resolve once during initialization, not per message.
-// After registering the schema via Terraform, look up the ID:
-//   const subject = '{topic}-value';
-//   const { id } = await this.registry.getSchemaByVersion(subject, 'latest');
-//   this.schemaId = id;
-// Note: Verify the exact SR client API against the version you install.
-
-// Producer call — encode the schema ID into headers
+// Producer call — encode schema ID into header, send clean JSON payload
 const buf = Buffer.alloc(4);
 buf.writeInt32BE(this.schemaId, 0);
 try {
@@ -1062,16 +1084,30 @@ private Producer $kafkaProducer;
 // Initialization (in constructor)
 // $conf = new Conf();
 // $conf->set('metadata.broker.list', env('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'));
+// $conf->set('enable.idempotence', 'true');
+// $conf->set('acks', 'all');
+// $conf->setDrMsgCb(function ($kafka, $message) {
+//     if ($message->err) {
+//         // TODO: Add DLQ or alerting for failed produces
+//         error_log("Kafka delivery failed: " . rd_kafka_err2str($message->err));
+//     }
+// });
 // $this->kafkaProducer = new Producer($conf);
 
 // Producer call — schema ID must be resolved after terraform apply.
-// Replace SCHEMA_ID_PENDING with the numeric ID from:
-//   curl -u "$SR_KEY:$SR_SECRET" "$SR_URL/subjects/{topic}-value/versions/latest" | jq '.id'
-$schemaId = 0; // TODO: Replace with numeric schema ID after terraform apply
+// Get the numeric ID: curl -u "$SR_KEY:$SR_SECRET" "$SR_URL/subjects/{topic}-value/versions/latest" | jq '.id'
+// WARNING: Do not produce with schemaId=0. Update this value before deploying.
+$schemaId = (int) env('SCHEMA_ID_{TOPIC}', 0);
+if ($schemaId === 0) {
+    throw new \RuntimeException('Schema ID not configured — run terraform apply and set SCHEMA_ID_{TOPIC} env var');
+}
 $topic = $this->kafkaProducer->newTopic('{topic}');
 $headers = ['__value_schema_id' => pack('N', $schemaId)];
 $topic->producev(RD_KAFKA_PARTITION_UA, 0, json_encode({eventArray}), {keyExpression}, $headers);
-$this->kafkaProducer->flush(1000);
+$remaining = $this->kafkaProducer->flush(5000);
+if ($remaining > 0) {
+    error_log("Kafka flush incomplete: $remaining message(s) still in queue");
+}
 ```
 
 **Patch construction rules:**
@@ -1119,7 +1155,7 @@ Create a comprehensive report at the repo root:
 | Medium-confidence candidates | {N} |
 | Low-confidence candidates | {N} |
 | PII fields identified | {N} |
-| Services already instrumented (skipped) | {N} |
+| Services already instrumented (scanned for additional candidates) | {N} |
 
 ---
 

@@ -348,7 +348,7 @@ different event types to a single topic.
    }
    ```
 
-3. Generate Terraform with `schema_reference` blocks:
+3. Generate Terraform with `schema_reference` blocks (abbreviated — add `schema_registry_cluster`, `rest_endpoint`, `credentials` per Phase 6.4 template):
    ```hcl
    # Individual event schemas registered first
    resource "confluent_schema" "user_event" {
@@ -388,18 +388,18 @@ different event types to a single topic.
 **Same data model, multiple topics (dedup):**
 If the same class produces to multiple topics (e.g., `order-events` and `order-events-dlq`),
 generate one schema file and multiple Terraform `confluent_schema` resources pointing to the
-same file:
+same file (abbreviated — add `schema_registry_cluster`, `rest_endpoint`, `credentials` per Phase 6.4):
 ```hcl
 resource "confluent_schema" "order_events_value" {
   subject_name = "order-events-value"
   schema       = file("../schemas/json/order-event.json")
-  ...
+  # ... add schema_registry_cluster, rest_endpoint, credentials, lifecycle
 }
 
 resource "confluent_schema" "order_events_dlq_value" {
   subject_name = "order-events-dlq-value"
   schema       = file("../schemas/json/order-event.json")  # same file
-  ...
+  # ... add schema_registry_cluster, rest_endpoint, credentials, lifecycle
 }
 ```
 
@@ -1315,10 +1315,11 @@ If Category A or C producers already have schemas registered in Schema Registry 
 # For schemas already registered in SR, import them before applying:
 # terraform import confluent_schema.{resource_name} {sr_cluster_id}/{subject_name}/{schema_id}
 #
-# Required environment variables:
-#   IMPORT_SCHEMA_REGISTRY_API_KEY
-#   IMPORT_SCHEMA_REGISTRY_API_SECRET
-#   IMPORT_SCHEMA_REGISTRY_REST_ENDPOINT
+# Required environment variables (same as used by the Confluent provider):
+#   SCHEMA_REGISTRY_API_KEY
+#   SCHEMA_REGISTRY_API_SECRET
+#   SCHEMA_REGISTRY_REST_ENDPOINT
+#   SCHEMA_REGISTRY_ID
 ```
 
 Add a `terraform/import.sh` helper script:
@@ -1706,7 +1707,7 @@ jobs:
 
       - name: Warn on StringSerializer for values
         run: |
-          if grep -ri "value.serializer.*StringSerializer\|value-serializer.*StringSerializer" \
+          if grep -rEi "value.serializer.*StringSerializer|value-serializer.*StringSerializer" \
             --include="*.properties" --include="*.yml" --include="*.java" .; then
             echo "::warning::StringSerializer for values — use KafkaJsonSchemaSerializer + HeaderSchemaIdSerializer"
           fi

@@ -47,7 +47,7 @@ Runs both modes and cross-references findings.
 
 1. **Run Audit first** — Read and follow `skill-audit.md` (Phases 0–8)
 2. **Pass Audit catalog to Discover** — After Audit completes, summarize the app catalog (from Phase 1.5) as a structured list: app name, role, topics, category, language. Hold this in your working context. Discover Phase D0.1 also reads `schema-report.md` for this context — use both sources. Pass this context to Discover so it:
-   - Skips services already fully instrumented (Category A — fully compliant with Confluent SR)
+   - For Category A services (fully compliant with Confluent SR), scans for *additional* event candidates beyond what's already being produced — flags these differently in the output
    - For partially instrumented services (B/C/D/E), looks for *additional* event candidates not already being produced
    - For un-instrumented services, runs full discovery
 3. **Run Discover** — Read and follow `skill-discover.md` (Phases D0–D5) with the Audit context
