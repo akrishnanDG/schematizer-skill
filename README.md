@@ -281,6 +281,8 @@ done
 
 Block PRs that introduce Kafka risks. Two approaches — AI-powered (full analysis) or grep-only (zero AI cost).
 
+> **Note:** The Audit skill (Phase 8) auto-generates a grep-only workflow at `terraform/ci/schema-lint.yml` (Approach B). Approach A below is a manually-configured option that runs the full AI-powered Audit skill on PRs.
+
 ### Approach A: Full AI Analysis as PR Gate (GitHub Actions + Claude Code)
 
 Runs the full Audit skill on every PR that touches Kafka files. Posts the report as a PR comment and fails the check if risks are found.

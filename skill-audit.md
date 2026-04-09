@@ -80,7 +80,7 @@ For each app with Kafka dependencies, search source files for producer/consumer 
 
 | Language | Patterns |
 |----------|----------|
-| Java | `KafkaTemplate`, `KafkaProducer`, `ProducerRecord`, `@SendTo`, `StreamBridge`, `ProducerFactory`, `KStream`, `KTable`, `StreamsBuilder`, `.to(`, `.through(` |
+| Java | `KafkaTemplate`, `KafkaProducer`, `ProducerRecord`, `@SendTo`, `StreamBridge`, `ProducerFactory`, `KStream`, `KTable`, `StreamsBuilder`, `.to(`, `.through(`, `@StreamListener`, `Function<Flux`, `Supplier<`, `spring.cloud.stream.bindings` |
 | Python | `Producer(`, `SerializingProducer(`, `AvroProducer(`, `.produce(`, `send(topic`, `send_and_wait(`, `AIOKafkaProducer(` |
 | .NET | `ProducerBuilder`, `IProducer`, `ProduceAsync`, `.Produce(` |
 | Go | `kafka.NewProducer`, `sarama.NewSyncProducer`, `sarama.NewAsyncProducer`, `kafka.NewWriter` |
@@ -91,10 +91,10 @@ For each app with Kafka dependencies, search source files for producer/consumer 
 
 | Language | Patterns |
 |----------|----------|
-| Java | `@KafkaListener`, `KafkaConsumer`, `ConsumerRecords`, `KafkaMessageListenerContainer`, `ConcurrentMessageListenerContainer` |
+| Java | `@KafkaListener`, `KafkaConsumer`, `ConsumerRecords`, `KafkaMessageListenerContainer`, `ConcurrentMessageListenerContainer`, `@StreamListener`, `Consumer<Flux`, `spring.cloud.stream.bindings` |
 | Python | `Consumer(`, `AvroConsumer(`, `.subscribe(`, `.poll(` |
 | .NET | `ConsumerBuilder`, `IConsumer`, `.Consume(`, `ConsumerConfig` |
-| Go | `kafka.NewConsumer`, `sarama.NewConsumerGroup`, `kafka.NewReader`, `.ReadMessage(` |
+| Go | `kafka.NewConsumer`, `sarama.NewConsumerGroup`, `sarama.NewConsumer`, `kafka.NewReader`, `.ReadMessage(` |
 | Node/TS | `consumer.run(`, `kafka.consumer(`, `consumer.subscribe(`, `eachMessage` |
 | PHP | `$consumer->consume(`, `$consumer->subscribe(`, `$consumer->poll(`, `RdKafka\Consumer`, `RdKafka\KafkaConsumer` |
 
@@ -104,6 +104,7 @@ Search for topic names in:
 - String literals passed to `send()`, `produce()`, `ProducerRecord`, `@KafkaListener`, `@SendTo`
 - Configuration properties: `spring.kafka.template.default-topic`, `TOPIC_NAME`, topic config constants
 - YAML/properties files: `spring.kafka.consumer.topics`, `spring.kafka.producer.topic`
+- Spring Cloud Stream bindings: `spring.cloud.stream.bindings.{channel}.destination` maps to topic names
 - Environment variables referenced for topics
 
 ### 1.4 Identify Serializers
@@ -475,6 +476,8 @@ auto\.register\.schemas.*true
 AutoRegisterSchemas\s*=\s*true
 auto_register_schemas.*True
 autoRegisterSchemas.*true
+AUTO_REGISTER_SCHEMAS.*true
+KAFKA_AUTO_REGISTER_SCHEMAS.*true
 ```
 
 **Files to prioritize:**
@@ -491,6 +494,12 @@ autoRegisterSchemas.*true
 **/*.ts
 **/*.js
 **/*.json (config files)
+**/docker-compose*.yml
+**/docker-compose*.yaml
+**/helm/**/values.yaml
+**/helm/**/values-*.yaml
+**/*deployment*.yaml
+**/*configmap*.yaml
 ```
 
 ### 2.2 Scan for `use.latest.version`
@@ -1109,7 +1118,7 @@ terraform {
   required_providers {
     confluent = {
       source  = "confluentinc/confluent"
-      version = "~> 2.0"
+      version = ">= 2.11.0"  # 2.11.0+ required for confluent_tag resources
     }
   }
 }
@@ -1803,3 +1812,5 @@ If MCP tools are not available, the skill still works — it just skips automate
 - **Test code:** Skip test directories (`**/test/**`, `**/tests/**`, `**/__tests__/**`, `**/src/test/**`) unless they contain the only schema/model definitions
 - **Multiple serializers per app:** If an app produces to multiple topics with different formats, create separate schema files and Terraform resources for each. If an app has different serializers for different topics, assign a category per `(app, topic)` pair. The app-level category in the summary table should be the worst category (E > D > C > B > A)
 - **Unsupported languages (Rust, Ruby, Elixir, etc.):** If the repo contains Kafka usage in languages not listed above, note the unsupported language in the report. Apply the closest supported language's patterns (Kotlin/Scala → Java, Ruby → Python). Mark all findings from unsupported languages as "Low confidence — manual verification required"
+- **Polyglot producers:** If different languages produce to the same topic (e.g., Java service and Python service both writing to `order-events`), ensure schema compatibility across languages. Note the language mismatch in the report
+- **Transactional producers:** If a producer uses `initTransactions()` / `beginTransaction()` / `commitTransaction()` (Java) or equivalent, note it in the app catalog. Transactional producers may write to multiple topics atomically — group those schemas together in the report

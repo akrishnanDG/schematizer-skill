@@ -38,4 +38,4 @@ Generate schemas, Terraform, and a full report.
 - [ ] Rollout order is "Consumers first"
 - [ ] No mention of "keep custom serializer" or "payload stays byte-identical" for Category E
 - [ ] SSN tagged as both PII and PRIVATE
-- [ ] Version numbers correct
+- [ ] Version numbers: Java CP 8.0+, Python v2.10.1+, .NET v2.10.1+, Go v2.10.1+, Node v1.3.2+

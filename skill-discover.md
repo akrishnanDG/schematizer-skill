@@ -128,7 +128,7 @@ implements Serializable
 **Note:** Use word-boundary `\b` after class name suffixes to avoid false positives (e.g., `class ClickEventSerializer` matching `class.*Event`).
 
 Look for:
-- Lombok-annotated classes (`@Data`, `@Value`, `@Builder`, `@Getter/@Setter`)
+- Lombok-annotated classes (`@Data`, `@Value`, `@Builder`, `@Getter/@Setter`). Note: `@Value` also matches Spring's `@Value` (property injection) — verify it appears on a class declaration, not a field
 - JPA/Hibernate entities (`@Entity`, `@Table`, `@Column`, `@Id`)
 - Java Records (`public record OrderEvent(...)`)
 - Spring Data MongoDB documents (`@Document`)
@@ -146,6 +146,8 @@ NamedTuple
 class.*Schema
 class.*models.Model
 class.*db.Model
+class.*\(Base\)
+Column\(
 ```
 
 Look for:
@@ -183,12 +185,12 @@ json:"
 ```
 
 Look for:
-- Structs with `json:"field_name"` tags
+- Structs with `json:"field_name"` tags (high volume — nearly every Go struct has these; cross-reference with Category 2/3/4 signals to filter noise)
 - Structs in `model/`, `domain/`, `entity/` packages
 - GORM models (embedding `gorm.Model`)
 - Structs with `bson:`, `db:`, or `xml:` tags
 
-**Node/TS — Grep patterns:**
+**Node/TS — Grep patterns (high volume — prioritize matches that also appear in Category 2/3/4):**
 ```
 interface\s+\w+
 type\s+\w+\s*=
@@ -358,7 +360,7 @@ Also look for:
 - Handler functions registered on HTTP routers
 - Functions that call `db.Create`, `db.Save`, `db.Update`
 
-**Node/TS — Grep patterns:**
+**Node/TS — Grep patterns (match both async and non-async methods):**
 ```
 async\s+update
 async\s+create
@@ -368,6 +370,10 @@ async\s+send
 async\s+process
 async\s+handle
 async\s+publish
+update\s*\(
+create\s*\(
+delete\s*\(
+save\s*\(
 ```
 
 Also look for:
@@ -417,8 +423,8 @@ Look for existing internal event systems that could be extended to Kafka:
 | Java | `extends ApplicationEvent`, `implements DomainEvent`, `@DomainEvents`, enums with `*Event`, `*Action`, `*Type` in name |
 | Python | Django signals (`post_save`, `pre_save`), custom event classes |
 | .NET | `IDomainEvent`, `INotification` (MediatR), `EventArgs` subclasses |
-| Go | Channel-based event patterns, custom event structs |
-| Node/TS | EventEmitter patterns, NestJS `@OnEvent()`, custom event classes |
+| Go | `chan\s+\w+Event`, `type\s+\w+Event\s+struct`, custom event structs sent to channels |
+| Node/TS | `EventEmitter`, `.emit(`, `@OnEvent(`, `@OnEvent()`, custom event classes |
 | PHP | Laravel events (`class XEvent`), Symfony events (`class XEvent extends Event`), `#[AsEventListener]` |
 
 ---
@@ -446,7 +452,7 @@ Assign points to each candidate based on the signals found:
 
 Group related symbols into a single candidate:
 - If a service method takes a DTO as a parameter and calls a repository write, group them: the DTO is the **schema source**, the method is the **insertion point**
-- If a DTO is referenced by multiple service methods, create one candidate per method (each produces a different event from the same schema)
+- If a DTO is referenced by multiple service methods, create one candidate per method (each produces a different event from the same schema). The DTO's base score (Cat 1 + Cat 2 signals) is shared across all derived candidates — differentiate by the method-specific signals (Cat 3 + Cat 4)
 - If an entity has internal events (`@DomainEvents`, Laravel events), group the event with its entity
 
 ### D2.3 Filtering
@@ -465,6 +471,7 @@ Based on score, assign a confidence level:
 | 8+ | High | Strong candidate — multiple signals align |
 | 5-7 | Medium | Good candidate — worth reviewing |
 | 3-4 | Low | Possible candidate — needs human judgment |
+| 1-2 | — | Excluded from top 20 — insufficient signals |
 
 ---
 
@@ -548,6 +555,8 @@ Every recommended event should include these standard envelope fields:
 | `source_service` | string | Service that produced the event |
 
 The remaining fields come from the domain model (Category 1) with PII tagging applied.
+
+**If the repo already has an event envelope or base event class** (e.g., a `BaseEvent` class with `correlationId`, `timestamp`, etc.), use that existing envelope structure instead of the default fields above. Note the deviation in the report.
 
 ### D3.4 PII Tagging
 
@@ -742,7 +751,7 @@ When a candidate has **Risk: Medium** or **Risk: High** (Phase D3.1), the Kafka 
 - The event does not represent a state transition in the source system
 
 **Framework-specific guidance:**
-- **Spring:** Use `@TransactionalEventListener(phase = AFTER_COMMIT)` to produce only after the DB transaction commits. For full outbox: use Debezium Outbox Connector.
+- **Spring:** Use `@TransactionalEventListener(phase = AFTER_COMMIT)` to produce only after the DB transaction commits. Trade-off: if the Kafka send fails after commit, the event is lost (DB committed but event not published). For guaranteed delivery: use the Debezium Outbox Connector (full outbox pattern).
 - **Django:** Use `transaction.on_commit(lambda: producer.produce(...))` to defer until after commit.
 - **Node/NestJS:** Use the `afterCommit` hook on Sequelize transactions, or implement an outbox table.
 - **Laravel:** Use `DB::afterCommit(fn () => ...)` to produce after the transaction commits.
@@ -1297,4 +1306,4 @@ The phases rely on these operations, which map to tools in any AI assistant or s
 | **Downstream consumer identification is limited** | In single-service repos, consumers cannot be identified from the codebase. Even in monorepos, cross-service dependencies may not be obvious from code alone. | Candidates with unknown consumers are marked as such. Fill in consumer information during human review. |
 | **No runtime validation** | This tool analyzes code statically. It cannot verify that recommended events are actually useful at runtime, or that the insertion points are transactionally safe. | Use the risk assessment (Low/Medium/High) as a guide. Medium/High risk candidates should be reviewed with domain experts. |
 | **PII detection is name-based** | PII tagging relies on field name patterns (email, phone, ssn). Fields with non-standard names containing PII will be missed. Fields matching patterns but not containing PII will be falsely tagged. | Always review PII tags. Add `PUBLIC` tag to false positives. Manually tag fields with non-standard names. |
-| **All services in test-repo already have Kafka** | The included test-repo is designed for Audit mode — every service already has Kafka producers. There are no "greenfield" services to test Discover mode against. | When testing Discover mode, use it against a real backend repo without Kafka, or add test services without Kafka dependencies. |
+| **Single-pass analysis** | The skill does a single grep-based pass. If a method calls another method that calls a repository write (indirect write path), the intermediate call chain is not traced. | Cross-reference Category 3 (mutations) with Category 4 (repository writes) manually for indirect paths. |
