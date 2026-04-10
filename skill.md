@@ -44,9 +44,10 @@ Scans repos to find domain models, entities, and service methods that are strong
 
 **Trigger phrases:** discover, find event candidates, where should I add Kafka, what should I stream
 
-**Outputs:** `discover/kafka_recommendations.yaml`, `discover/kafka_schemas.yaml`, `discover/patches/`, `discover-report.md`
+**Default outputs:** `discover/kafka_recommendations.yaml`, `discover/kafka_schemas.yaml`
+**Opt-in outputs:** `discover/patches/` (if user asks for patches), `discover-report.md` (if user asks for report)
 
-**How:** Read and follow `skill-discover.md` (Phases D0–D5).
+**How:** Read and follow `skill-discover.md` (Phases D0–D5). Phases D4.4 and D5 are opt-in.
 
 ### Combined Mode — Full Analysis
 
@@ -97,7 +98,15 @@ Always confirm with the user if uncertain.
     ci/schema-lint.yml
 ```
 
-### Discover
+### Discover (default)
+```
+{repo}/
+  discover/
+    kafka_recommendations.yaml
+    kafka_schemas.yaml
+```
+
+### Discover (with opt-ins: "include patches and report")
 ```
 {repo}/
   discover-report.md
@@ -112,9 +121,9 @@ Always confirm with the user if uncertain.
 {repo}/
   schema-report.md
   schemas/
+  contracts/
   terraform/
     ci/schema-lint.yml
-  discover-report.md
   discover/
     kafka_recommendations.yaml
     kafka_schemas.yaml

@@ -2,9 +2,14 @@
 
 ## Test Prompt
 
+Default (fast — no patches or report):
 ```
-Discover where Kafka events should be added in the atlas-banking-platform/loan-origination service.
-Generate recommendations, schema stubs, and code patches.
+Discover where Kafka events should be added in the loan-origination service.
+```
+
+Full (with opt-in outputs):
+```
+Discover where Kafka events should be added in the loan-origination service. Include patches and report.
 ```
 
 ## Scope

@@ -4,8 +4,10 @@
 
 ```
 Discover where Kafka events should be added in the test-repo/order-api directory.
-Generate recommendations, schema stubs, and code patches.
+Include patches and report.
 ```
+
+Note: "Include patches and report" is required to trigger opt-in outputs. Without it, only kafka_recommendations.yaml and kafka_schemas.yaml are generated.
 
 ## Scope
 

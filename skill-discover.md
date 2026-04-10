@@ -1,6 +1,6 @@
 # Kafka Event Discovery
 
-Scan a backend repository to identify domain models, DTOs, entities, and service methods that are strong candidates for Kafka event publication. Produce a ranked recommendation plan, schema stubs, and ready-to-apply code patches.
+Scan a backend repository to identify domain models, DTOs, entities, and service methods that are strong candidates for Kafka event publication. Produce a ranked recommendation plan and schema stubs.
 
 ## When to Use
 
@@ -8,10 +8,17 @@ Invoke when a user wants to find where Kafka events should be added, asks "what 
 
 ## Deliverables
 
+**Always generated (default):**
 1. **`discover/kafka_recommendations.yaml`** — Ranked candidates with business reasoning
 2. **`discover/kafka_schemas.yaml`** — SR-compatible event schema stubs
+
+**Opt-in (only when user explicitly asks for patches, code generation, or "include patches"):**
 3. **`discover/patches/`** — Git-apply-ready unified diffs adding Kafka producer code
+
+**Opt-in (only when user explicitly asks for a report or "include report"):**
 4. **`discover-report.md`** — Discovery report
+
+By default, generate only the YAML files (1 + 2). These are the fastest to produce and contain all the decision-making value. Patches and reports are slow to generate and often need manual adjustment — only produce them when requested.
 
 ---
 
@@ -301,9 +308,11 @@ When a candidate has **Risk: Medium or High**, the produce must be transactional
 
 Note transactional safety concerns in `kafka_recommendations.yaml` under `notes`.
 
-### D4.4 Generate Patch Files
+### D4.4 Generate Patch Files (OPT-IN ONLY)
 
-For each candidate, create a git-apply-ready patch at `discover/patches/{service}-kafka-producer.patch`.
+**Skip this phase unless the user explicitly asked for patches, code generation, or said "include patches".**
+
+If requested, for each candidate, create a git-apply-ready patch at `discover/patches/{service}-kafka-producer.patch`.
 
 **Patch construction rules:**
 1. Read the target file. Record exact content and line numbers.
@@ -321,9 +330,11 @@ For each candidate, create a git-apply-ready patch at `discover/patches/{service
 
 ---
 
-## Phase D5: Generate Report — `discover-report.md`
+## Phase D5: Generate Report — `discover-report.md` (OPT-IN ONLY)
 
-Report sections (use markdown tables throughout):
+**Skip this phase unless the user explicitly asked for a report or said "include report".**
+
+If requested, report sections (use markdown tables throughout):
 
 1. **Executive Summary** — Table with: services scanned, languages detected, domain models found, event candidates by confidence level, PII fields identified, already-instrumented services
 2. **Top Event Candidates** — Table: #, Service, Event, Topic, Confidence, Business Value (one row per candidate)
@@ -331,7 +342,7 @@ Report sections (use markdown tables throughout):
 4. **Services Without Candidates** — Table: Service, Language, Reason
 5. **PII Fields Detected** — Table: Event, Field, Tags, Reason
 6. **Output Files** — Table listing the 3 output files and their purpose
-7. **Next Steps** — Checklist: review/approve candidates, review schemas, apply patches, add dependencies, run Audit for Terraform, register schemas
+7. **Next Steps** — Checklist: review/approve candidates, review schemas, add dependencies, run Audit for Terraform, register schemas. If patches were generated, include: verify with `git apply --check`, apply patches
 
 ---
 
