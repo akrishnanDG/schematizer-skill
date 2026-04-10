@@ -16,6 +16,16 @@ Invoke this skill when:
 
 ## Modes
 
+### PR Mode — "Is this PR safe?"
+
+Scans only changed files in a PR for Kafka governance risks. Fastest mode.
+
+**Trigger phrases:** scan this PR, check my changes, review this diff, is this PR safe
+
+**Outputs:** PR review comment (PASS / WARN / FAIL)
+
+**How:** Read and follow `skill-scan.md` — PR Mode section (before Phase 0).
+
 ### Scan Mode — "What's the current state?"
 
 Quick classification of all Kafka apps in a repo. Produces a structured catalog with categories, risks, and PII inventory. No artifacts generated.
@@ -24,7 +34,7 @@ Quick classification of all Kafka apps in a repo. Produces a structured catalog 
 
 **Outputs:** App catalog (in-context) with category assignments
 
-**How:** Read and follow `skill-scan.md`.
+**How:** Read and follow `skill-scan.md` (Phases 0–4).
 
 ### Audit Mode — "Fix what's broken"
 

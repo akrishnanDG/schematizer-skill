@@ -105,13 +105,27 @@ Default to BACKWARD unless the user specifies otherwise. Compatibility mode is s
 
 For each data model found in the scan phase, generate a **pure schema file** — no `confluent:tags`, no `metadata`, no `ruleset`. PII tags and rules go in a separate contract file (see "Contract File Generation" below).
 
+**Schema generation MUST be template-based, not LLM-inferred.** Use the exact templates below — substitute only the placeholder values. Do not improvise schema structure, add extra fields, or change the template format.
+
+### Mandatory Rules (all formats)
+
+- **Field naming**: `camelCase` for JSON Schema and Avro, `snake_case` for Protobuf
+- **Descriptions**: Every field MUST have a `doc` (Avro) or `description` (JSON Schema)
+- **Defaults on ALL optional fields** — every optional field MUST have a default value. Only primary key / identifier field(s) may omit a default.
+- **Avro enums**: `UNKNOWN` as first symbol with `"default": "UNKNOWN"` for forward compatibility
+- **`additionalProperties: false`** — always set for JSON Schema (BACKWARD is the default compatibility mode)
+- **Nullable fields**: JSON Schema uses `["string", "null"]` type array; Avro uses `["null", "string"]` union with `"default": null`
+- **Timestamps**: JSON Schema uses `{"type": "string", "format": "date-time"}`; Avro uses `{"type": "long", "logicalType": "timestamp-millis"}`
+- **Do NOT add `confluent:tags` or `confluent.field_meta`** to any schema file — tags go in the contract file
+
 ### JSON Schema
 
 - Map language types: `string->string`, `int/long->integer`, `float/double->number`, `boolean->boolean`, `List->array`, `Map->object`
 - Include `required` array for non-nullable fields
 - Add `$schema: "http://json-schema.org/draft-07/schema#"` and `title` matching the class/model name
 - Add `"default"` values on optional properties for schema evolution safety
-- **`additionalProperties`:** Set to `false` only if the subject uses BACKWARD compatibility (SR default). If FORWARD or FULL compatibility is needed, omit `additionalProperties` or set to `true`
+- **`additionalProperties: false`** — always set (BACKWARD is the default compatibility mode). If FORWARD or FULL compatibility is explicitly requested, omit `additionalProperties` or set to `true`
+- Add `"description"` on every property
 - **Do NOT add `confluent:tags` to schema properties** — tags go in the contract file
 
 Example (clean schema, no tags):
@@ -122,12 +136,13 @@ Example (clean schema, no tags):
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "customer_id": { "type": "string" },
-    "email": { "type": "string", "default": "" },
-    "phone_number": { "type": "string", "default": "" },
-    "order_total": { "type": "number", "default": 0 }
+    "customerId": { "type": "string", "description": "Unique customer identifier" },
+    "email": { "type": "string", "description": "Customer email address", "default": "" },
+    "phoneNumber": { "type": ["string", "null"], "description": "Customer phone number", "default": null },
+    "orderTotal": { "type": "number", "description": "Total order amount", "default": 0 },
+    "createdAt": { "type": "string", "format": "date-time", "description": "Record creation timestamp", "default": "" }
   },
-  "required": ["customer_id", "email"]
+  "required": ["customerId", "email"]
 }
 ```
 
@@ -136,6 +151,7 @@ Example (clean schema, no tags):
 - Use `type: "record"` with `namespace` from package/module
 - Map types: `String->string`, `int->int`, `long->long`, `float->float`, `double->double`, `boolean->boolean`, `List->array`, `Map->map`
 - Use `["null", "type"]` union for nullable/optional fields with `"default": null`
+- Add `"doc"` on every field
 - **Do NOT add `confluent:tags` to fields** — tags go in the contract file
 
 **Schema evolution defaults (Avro):** Every optional field MUST have a `default` value. Use these defaults by type:
@@ -144,7 +160,8 @@ Example (clean schema, no tags):
 - `float`, `double` -> `"default": 0.0`
 - `boolean` -> `"default": false`
 - nullable union `["null", "type"]` -> `"default": null`
-- `enum` -> `"default": "<first symbol>"`
+- `enum` -> `"default": "UNKNOWN"` (UNKNOWN MUST be the first symbol)
+- `long` with `logicalType: timestamp-millis` -> `"default": 0`
 
 Only the primary key / identifier field(s) should omit a default.
 
@@ -155,10 +172,12 @@ Example (clean schema, no tags):
   "name": "Customer",
   "namespace": "com.example.events",
   "fields": [
-    { "name": "customer_id", "type": "string" },
-    { "name": "email", "type": "string", "default": "" },
-    { "name": "ssn", "type": ["null", "string"], "default": null },
-    { "name": "order_total", "type": "double", "default": 0.0 }
+    { "name": "customerId", "type": "string", "doc": "Unique customer identifier" },
+    { "name": "email", "type": "string", "doc": "Customer email address", "default": "" },
+    { "name": "ssn", "type": ["null", "string"], "doc": "Social security number", "default": null },
+    { "name": "orderTotal", "type": "double", "doc": "Total order amount", "default": 0.0 },
+    { "name": "createdAt", "type": { "type": "long", "logicalType": "timestamp-millis" }, "doc": "Record creation timestamp", "default": 0 },
+    { "name": "status", "type": { "type": "enum", "name": "Status", "symbols": ["UNKNOWN", "ACTIVE", "INACTIVE"] }, "doc": "Customer status", "default": "UNKNOWN" }
   ]
 }
 ```
@@ -167,7 +186,9 @@ Example (clean schema, no tags):
 
 - Use `syntax = "proto3"`
 - Map types: `String->string`, `int->int32`, `long->int64`, `float->float`, `double->double`, `boolean->bool`, `List->repeated`, `Map->map<K,V>`
+- Use `snake_case` for all field names
 - Add `package` from namespace
+- Use `google.protobuf.Timestamp` for timestamp fields (add `import "google/protobuf/timestamp.proto";`)
 - **Do NOT add `confluent.field_meta` annotations** — tags go in the contract file
 
 Example (clean schema, no tags):
@@ -176,11 +197,14 @@ syntax = "proto3";
 
 package com.example.events;
 
+import "google/protobuf/timestamp.proto";
+
 message Customer {
   string customer_id = 1;
   string email = 2;
   string ssn = 3;
   double order_total = 4;
+  google.protobuf.Timestamp created_at = 5;
 }
 ```
 
@@ -729,6 +753,87 @@ variable "kms_key_id" {
   sensitive   = true
 }
 ```
+
+---
+
+## Local Validation
+
+Generate `scripts/validate-schemas.sh` that validates generated schemas locally without a Schema Registry connection.
+
+### JSON Schema validation (requires `jsonschema` or `check-jsonschema` Python package):
+```bash
+pip install check-jsonschema
+for f in schemas/json/*.json; do
+  check-jsonschema --check-metaschema "$f" && echo "OK: $f" || echo "FAIL: $f"
+done
+```
+
+### Avro validation (requires `avro-tools` or maven plugin):
+
+If the repo has a `pom.xml`, generate a `schemas/pom.xml` with the `schema-registry-maven-plugin`:
+```xml
+<plugin>
+  <groupId>io.confluent</groupId>
+  <artifactId>kafka-schema-registry-maven-plugin</artifactId>
+  <version>7.6.0</version>
+  <configuration>
+    <schemaTypes>
+      <atlas.fraud.alerts-value>AVRO</atlas.fraud.alerts-value>
+    </schemaTypes>
+    <schemas>
+      <atlas.fraud.alerts-value>schemas/avro/atlas.fraud.alerts-value.avsc</atlas.fraud.alerts-value>
+    </schemas>
+  </configuration>
+</plugin>
+```
+
+Run: `mvn schema-registry:validate` (validates schema syntax without SR connection when no SR URL is configured)
+
+### Contract validation:
+```bash
+for f in contracts/*.contract.json; do
+  python3 -c "
+import json, sys
+d = json.load(open('$f'))
+assert 'subject' in d, 'missing subject'
+assert 'metadata' in d and 'tags' in d['metadata'], 'missing metadata.tags'
+for k, v in d['metadata']['tags'].items():
+    assert k.startswith('*.'), f'field path {k} must start with *.'
+    assert all(t in ('PII','PRIVATE','SENSITIVE','PHI','PUBLIC') for t in v), f'invalid tag in {v}'
+print(f'OK: $f')
+" || echo "FAIL: $f"
+done
+```
+
+### Deterministic output verification:
+```bash
+# Verify no confluent:tags in schema files
+grep -rl "confluent:tags" schemas/ && echo "FAIL: schemas contain tags" && exit 1
+grep -rl "confluent.field_meta" schemas/ && echo "FAIL: schemas contain field_meta" && exit 1
+
+# Verify all JSON schemas have additionalProperties: false
+for f in schemas/json/*.json; do
+  python3 -c "
+import json
+d = json.load(open('$f'))
+if d.get('type') == 'object' and 'additionalProperties' not in d:
+    print(f'WARN: $f missing additionalProperties')
+"
+done
+
+# Verify all Avro fields have defaults
+for f in schemas/avro/*.avsc; do
+  python3 -c "
+import json
+d = json.load(open('$f'))
+for field in d.get('fields', []):
+    if 'default' not in field:
+        print(f'WARN: $f field {field[\"name\"]} missing default')
+"
+done
+```
+
+Wrap all of these checks into the single `scripts/validate-schemas.sh` script that the skill generates alongside the schemas. Include it in the report's Next Steps: "Run `bash scripts/validate-schemas.sh` to verify schemas locally before `terraform apply`."
 
 ---
 

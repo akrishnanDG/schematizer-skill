@@ -9,6 +9,61 @@ Scan a repository to detect Kafka applications, classify producers into governan
 
 ---
 
+## PR Mode (Incremental Scan)
+
+Use this mode when the user says "scan this PR", "check my changes", "review this diff", or similar. It scans only changed files instead of the full repo.
+
+### Step 1: Get Changed Files
+
+Run `git diff --name-only main...HEAD` (substitute the actual base branch if not `main`). If on the base branch itself, use `git diff --name-only HEAD~1`.
+
+### Step 2: Filter to Kafka-Relevant Files
+
+From the changed files, keep only those matching:
+- **Build files:** `pom.xml`, `build.gradle`, `package.json`, `go.mod`, `*.csproj`, `requirements.txt`
+- **Kafka source files:** paths containing `Producer`, `Consumer`, `Serializer`, `kafka`, or `Kafka`
+- **Config files:** `application.properties`, `application.yml`, `*.json` inside connector directories
+- **Schema files:** `*.avsc`, `*.proto`, `*.json` inside `schemas/`
+
+If no files match, output Status: PASS and stop.
+
+### Step 3: Scan Matched Files Through Phases 1-4
+
+Run the matched files through the standard Phases 1-4 logic but scoped only to those files (skip full repo discovery).
+
+### Step 4: Check Diff for Risk Patterns
+
+Read the actual diff (`git diff main...HEAD`) for the matched files and flag:
+- `auto.register.schemas=true` added (any language variant)
+- `StringSerializer`, `json.dumps`, or `JSON.stringify` added in producer code
+- `kafkajs` added as a new dependency
+- Schema file (`.avsc`, `.proto`) changed without a corresponding Terraform or contract update
+- New Kafka producer created without `schema.registry.url` configuration
+
+### Step 5: Output PR Review
+
+```
+## Kafka Schema Review
+
+### Changes detected:
+- {file}: {what changed}
+
+### Risks:
+- {risk description}
+
+### Recommendations:
+- {action items}
+
+### Status: PASS / WARN / FAIL
+```
+
+**Status criteria:**
+- **PASS** -- no Kafka-related risks found
+- **WARN** -- Kafka changes detected but no governance violations
+- **FAIL** -- `auto.register.schemas=true`, missing Schema Registry config, or wrong serializer
+
+---
+
 ## Phase 0: Initialize
 
 Call `schema_status` MCP tool if available (provides context on existing schema.yaml, registered schemas, environments). Otherwise, check if `schema.yaml` or `schemas/` directory already exists in the repo.
