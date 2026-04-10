@@ -190,6 +190,12 @@ Apply PII detection from `skill-audit.md` Phase 3.3b. Tag fields with `confluent
 
 ---
 
+## Pre-Flight: Check for Existing Output
+
+Before writing files, check if `discover/` or `discover-report.md` already exist. If so, ask the user before overwriting. In non-interactive mode, back up existing output with a timestamp suffix.
+
+---
+
 ## Phase D4: Generate Outputs
 
 ### D4.2 Generate `discover/kafka_recommendations.yaml`

@@ -26,6 +26,27 @@ App catalog from `skill-scan.md` containing for each Kafka application:
 
 ---
 
+## Pre-Flight: Check for Existing Output
+
+**Before writing any files, check if output directories already exist.** If they do, the skill has been run before and the output may contain manual edits. Overwriting without warning is a data loss risk.
+
+Check for: `schemas/`, `contracts/`, `terraform/`, `schema-report.md`, `scripts/validate-schemas.sh`
+
+**If any exist:**
+1. List the existing files found
+2. **Ask the user**: "Previous schematizer output found. Overwrite? (y/n)" 
+3. If the user says no, stop. If yes, proceed.
+4. If running in non-interactive mode (`-p` flag / piped input), **append `-backup` timestamp suffix** to existing directories before writing new output:
+   ```
+   mv schemas schemas-backup-20260410
+   mv contracts contracts-backup-20260410
+   mv terraform terraform-backup-20260410
+   ```
+
+**If none exist:** proceed normally — first run.
+
+---
+
 ## Phase 5: Create Schema Files
 
 ### 5.1 Directory Structure
