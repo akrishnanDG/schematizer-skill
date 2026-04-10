@@ -869,9 +869,21 @@ Create a comprehensive markdown report at the repo root. Use the template below,
 |----------|-------|-------------|
 | A: Compliant | N | Using Confluent serializer + SR |
 | B: Needs SR | N | Schema in code but no SR integration |
-| C: Auto-register | N | Using auto.register.schemas=true |
+| C-App: Auto-register | N | Application producer with auto.register.schemas=true |
+| C-Connector: Auto-register | N | Kafka Connect source connector (by design) |
 | D: No schema | N | No discernible schema |
 | E: Custom serializer | N | Custom Serializer/inline serialization without SR |
+
+### Minimum Client Versions for Migration
+
+**Always include this block in the report — these are verified minimum versions for HeaderSchemaIdSerializer support:**
+
+> **Minimum versions required:**
+> - Java: CP 8.0+
+> - Python: confluent-kafka v2.10.1+
+> - Go: confluent-kafka-go v2.10.1+
+> - .NET: Confluent.Kafka v2.10.1+
+> - Node.js: @confluentinc/kafka-javascript v1.3.2+
 
 ---
 
