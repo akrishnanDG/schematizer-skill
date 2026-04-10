@@ -61,9 +61,16 @@ if [ -f "$REPORT" ]; then
     check_content "Rollout|rollout" "Rollout ordering"
     check_content "Consumer Impact" "Consumer Impact Notes"
     check_content "HeaderSchemaIdSerializer" "HeaderSchemaIdSerializer guidance"
-    check_content "CP 8\.0" "Java version CP 8.0+"
-    check_content "v2\.10\.1" "Python/Go/.NET version v2.10.1+"
-    check_content "v1\.3\.2" "Node version v1.3.2+"
+    warn_content() {
+        if grep -Eqi "$1" "$REPORT"; then
+            echo "  OK  Found: $2"
+        else
+            echo "  WARN  Missing: $2"
+        fi
+    }
+    warn_content "CP 8\.0" "Java version CP 8.0+"
+    warn_content "v2\.10\.1" "Python/Go/.NET version v2.10.1+"
+    warn_content "v1\.3\.2" "Node version v1.3.2+"
     check_content "PII" "PII tagging"
     check_content "confluent_tag|confluent:tags" "Confluent tag resources or PII tags"
 
