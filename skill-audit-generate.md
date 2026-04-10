@@ -833,7 +833,76 @@ for field in d.get('fields', []):
 done
 ```
 
-Wrap all of these checks into the single `scripts/validate-schemas.sh` script that the skill generates alongside the schemas. Include it in the report's Next Steps: "Run `bash scripts/validate-schemas.sh` to verify schemas locally before `terraform apply`."
+### Live Schema Registry compatibility check (requires SR credentials):
+
+If the environment variables `SCHEMA_REGISTRY_URL`, `SCHEMA_REGISTRY_API_KEY`, and `SCHEMA_REGISTRY_API_SECRET` are set, check each generated schema for backward compatibility against the live SR before registration:
+
+```bash
+if [ -n "$SCHEMA_REGISTRY_URL" ] && [ -n "$SCHEMA_REGISTRY_API_KEY" ] && [ -n "$SCHEMA_REGISTRY_API_SECRET" ]; then
+  echo "=== Live SR Compatibility Check ==="
+  SR_AUTH="$SCHEMA_REGISTRY_API_KEY:$SCHEMA_REGISTRY_API_SECRET"
+  COMPAT_FAIL=0
+
+  for f in schemas/json/*.json schemas/avro/*.avsc; do
+    [ -f "$f" ] || continue
+    # Derive subject from filename: atlas.foo.bar-value.json → atlas.foo.bar-value
+    subject=$(basename "$f" | sed 's/\.json$//; s/\.avsc$//')
+
+    # Determine schema type
+    case "$f" in
+      *.avsc) schema_type="AVRO" ;;
+      *.json) schema_type="JSON" ;;
+    esac
+
+    # Check if subject already exists in SR
+    existing=$(curl -s -o /dev/null -w "%{http_code}" -u "$SR_AUTH" \
+      "$SCHEMA_REGISTRY_URL/subjects/$subject/versions")
+
+    if [ "$existing" = "200" ]; then
+      # Subject exists — check compatibility
+      schema_escaped=$(python3 -c "import json; print(json.dumps(json.dumps(json.load(open('$f')))))")
+      result=$(curl -s -X POST -u "$SR_AUTH" \
+        -H "Content-Type: application/vnd.schemaregistry.v1+json" \
+        "$SCHEMA_REGISTRY_URL/compatibility/subjects/$subject/versions/latest" \
+        -d "{\"schemaType\":\"$schema_type\",\"schema\":$schema_escaped}")
+
+      is_compat=$(echo "$result" | python3 -c "import json,sys; print(json.load(sys.stdin).get('is_compatible','ERROR'))" 2>/dev/null)
+
+      if [ "$is_compat" = "True" ]; then
+        echo "  OK  $subject: compatible with latest version"
+      else
+        echo "  FAIL  $subject: INCOMPATIBLE with latest version"
+        echo "        $result"
+        COMPAT_FAIL=1
+      fi
+    else
+      echo "  NEW  $subject: not yet registered (will be created)"
+    fi
+  done
+
+  if [ "$COMPAT_FAIL" -eq 1 ]; then
+    echo ""
+    echo "FAIL: One or more schemas are incompatible with the live SR."
+    echo "Fix the schema or change the subject compatibility mode before running terraform apply."
+    exit 1
+  fi
+else
+  echo "=== Live SR Compatibility Check: SKIPPED ==="
+  echo "Set SCHEMA_REGISTRY_URL, SCHEMA_REGISTRY_API_KEY, and SCHEMA_REGISTRY_API_SECRET to enable."
+fi
+```
+
+Wrap all checks (local validation + live SR compatibility) into the single `scripts/validate-schemas.sh` script. Include it in the report's Next Steps:
+
+```
+1. Run `bash scripts/validate-schemas.sh` to verify schemas locally
+2. Set SR credentials and re-run to check compatibility against live SR:
+   export SCHEMA_REGISTRY_URL=https://psrc-xxxxx.region.aws.confluent.cloud
+   export SCHEMA_REGISTRY_API_KEY=<key>
+   export SCHEMA_REGISTRY_API_SECRET=<secret>
+   bash scripts/validate-schemas.sh
+3. Run `terraform plan` then `terraform apply`
+```
 
 ---
 
