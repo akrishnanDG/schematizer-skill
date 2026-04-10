@@ -18,6 +18,7 @@ Generate a full report with upgrade recommendations.
 
 ### Schemas
 - **No schema extraction** — schemas are already registered in SR
+- **No contract files generated** — nothing to bind tags to
 
 ### Report
 - Recommends adding `HeaderSchemaIdSerializer` to producer config
@@ -28,6 +29,7 @@ Generate a full report with upgrade recommendations.
 ### Assertions
 - [ ] Service classified as A→Header (not just A)
 - [ ] No schema files generated for this service
+- [ ] No contract files generated for this service
 - [ ] Recommendation: add HeaderSchemaIdSerializer only
 - [ ] Consumer action: "None" — automatic dual-read handles it
 - [ ] Rollout order is "Producers only"

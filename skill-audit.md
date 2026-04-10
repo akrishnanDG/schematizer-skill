@@ -432,13 +432,60 @@ JsonConverter
 ```
 
 **Classification:**
-- If `value.converter` uses `AvroConverter`/`JsonSchemaConverter`/`ProtobufConverter` with `schema.registry.url` → **Category A** (SR-integrated)
-- If `value.converter` uses `JsonConverter` without SR → **Category B** (JSON, no SR)
-- If `auto.register.schemas=true` is explicitly set → **Category C**. If the property is absent, check the Connect worker version: Confluent Platform >= 7.x defaults to `false` (Category A), older versions default to `true` (Category C)
-- For Debezium source connectors: the source table DDL defines the schema. Note the `database.server.name`, `table.include.list`, and topic naming pattern (`{server}.{schema}.{table}`)
-- For sink connectors: record them as **consumers** in the app catalog, not producers
 
-Add discovered connectors to the app catalog with `role: connector-source` or `role: connector-sink`.
+- If `value.converter` uses `AvroConverter`/`JsonSchemaConverter`/`ProtobufConverter` with `schema.registry.url` and `auto.register.schemas=false` (or CP >= 7.x default) → **Category A** (SR-integrated, governed)
+- If `value.converter` uses `JsonConverter` without SR → **Category B** (JSON, no SR)
+- For sink connectors: record them as **consumers** in the app catalog, not producers. Classify by how they deserialize: if they use a Schema Registry converter, they are SR-integrated consumers.
+
+**Distinguishing application auto-register from connector-native auto-register:**
+
+This distinction is critical. `auto.register.schemas=true` means completely different things depending on where it appears:
+
+| Context | Meaning | Classification |
+|---------|---------|----------------|
+| Application producer config (Spring Boot properties, Python `ProducerConfig`, .NET `ProducerConfig`, Go `ConfigMap`) | Developer left the default on or didn't know the risk. SR schema evolves silently. Breaking. | **Category C (Application)** — flag as risk, disable immediately |
+| Kafka Connect source connector converter config (`key.converter.auto.register.schemas`, `value.converter.auto.register.schemas`) | Connector introspects the source system schema at runtime and must register it. This is by design for source connectors and cannot be disabled without breaking the connector. | **Category C (Connector)** — expected behavior, apply connector governance instead |
+
+**Connector types that require auto-register by design (do NOT flag as misconfiguration):**
+
+| Connector Family | Examples | Why auto-register is required |
+|-----------------|----------|-------------------------------|
+| CDC connectors | Debezium PostgreSQL, MySQL, SQL Server, Oracle, MongoDB; Confluent JDBC Source | Introspects source table DDL at runtime. Schema is determined by the source DB, not by developer code. Disabling auto-register breaks the connector. |
+| File/object source | Confluent S3 Source, GCS Source, Azure Blob Source | Reads schema from file headers or infers from data shape. |
+| NoSQL source | MongoDB Atlas Source, DynamoDB Source, Cassandra Source | Source schema is dynamic and schema-inferred at runtime. |
+| Replication connectors | MirrorMaker2 (MM2) with SR replication | Mirrors schemas from another SR cluster. Registering them manually would duplicate or conflict. |
+| SaaS source connectors | Salesforce Source, ServiceNow Source, Zendesk Source | SaaS schema is owned by the vendor and changes outside developer control. |
+
+**For Category C (Connector) — governance actions (NOT disabling auto-register):**
+
+The goal is not to disable auto-register (that breaks the connector) but to add governance on top of it.
+
+1. **Compatibility mode** — Connector schemas evolve whenever the source system changes (DDL change, new field, dropped field). Set the compatibility mode explicitly per subject via `confluent_subject_config` in Terraform. For CDC connectors, `NONE` or `BACKWARD` is typical since source DDL changes may not be fully backward-compatible. Document the choice.
+
+2. **Subject naming strategy** — Control how connectors name their SR subjects. Configure `value.converter.schema.registry.subject.naming.strategy` (and key variant):
+   - `io.confluent.kafka.serializers.subject.TopicNameStrategy` (default): `{topic}-value` — one subject per topic, all table events share a schema
+   - `io.confluent.kafka.serializers.subject.RecordNameStrategy`: `{namespace}.{RecordName}` — one subject per record type, regardless of topic
+   - `io.confluent.kafka.serializers.subject.TopicRecordNameStrategy`: `{topic}-{RecordName}` — most granular, one subject per topic+record combination; best for CDC where each table maps to its own schema
+   - **Recommendation for CDC:** Use `TopicRecordNameStrategy` so each table's schema is independently versioned.
+
+3. **PII tagging** — Source connectors register schemas automatically with no `confluent:tags` because the schema is generated from DB column metadata, not hand-authored. Apply PII tags post-registration:
+   - **Terraform:** Generate `confluent_tag_binding` resources that apply `PII`/`PRIVATE` tags to specific fields on specific SR subjects after `confluent_schema` is registered.
+   - **Stream Catalog:** Tag fields via the Confluent Cloud UI or Tag Management API (`POST /catalog/v1/types/tagdefs`).
+   - **SMT masking (stronger):** If PII must be masked or removed *before* it lands in Kafka (not just tagged for governance), use Kafka Connect Single Message Transforms (SMTs) — `MaskField` to zero-out sensitive columns, `ReplaceField` to drop them, or a custom SMT for pseudonymization.
+
+4. **Schema monitoring** — Enable alerting when a connector registers an unexpected new subject or a new schema version. A new registration means the source system DDL changed. Integrate Schema Registry webhooks or poll the REST API (`GET /subjects/{subject}/versions`) in your monitoring pipeline.
+
+5. **Import into Terraform state** — After the connector has registered schemas, import them into Terraform state so future changes are tracked:
+   ```bash
+   terraform import confluent_schema.{resource_name} "$SCHEMA_REGISTRY_ID/{subject_name}/latest"
+   ```
+
+**For Category C (Application) — standard remediation:**
+1. Set `auto.register.schemas=false` in the producer config
+2. Register schemas via Terraform (see `terraform/flagged-auto-register.tf`)
+3. Set `use.latest.version=true` so the producer fetches the latest registered schema version
+
+Add discovered connectors to the app catalog with `role: connector-source` or `role: connector-sink`. Record the connector family (CDC, file, SaaS, replication) to select the correct governance path.
 
 ### 1.8 Detect Key Schemas
 
@@ -1022,7 +1069,8 @@ Classify each producer into a category based on findings:
 | **A: Compliant** | Uses Confluent serializer + schema.registry.url configured + `auto.register.schemas` is explicitly `false` or absent on client versions where the default is `false` (Java >= 7.x, Python >= 2.0) | Report as compliant. Still extract schema to Terraform if not already managed by IaC. If Terraform files already exist in the repo for these subjects, skip generation. |
 | **A→Header: Already on SR, migrating to headers** | Uses Confluent serializer + SR, wants to move schema ID from payload prefix to Kafka headers | No schema extraction needed. Add `HeaderSchemaIdSerializer` to producers. Consumers need no changes — Confluent deserializers on supported versions automatically check both headers and payload for schema ID. See rollout ordering below. |
 | **B: Schema in code, no SR** | Has data models/classes but uses StringSerializer, JsonSerializer (Spring), kafka-python, kafkajs raw, or no Confluent SR integration | Extract schema → `terraform/schemas.tf` + add upgrade recommendation to report |
-| **C: Auto-register** | Has `auto.register.schemas=true` | Extract schema → `terraform/flagged-auto-register.tf` (commented out) + flag risk in report |
+| **C-App: Auto-register (application)** | Application producer has `auto.register.schemas=true` in its own config (Spring Boot properties, Python ProducerConfig, .NET ProducerConfig, Go ConfigMap) | Flag as risk. Extract schema → `terraform/flagged-auto-register.tf` (commented out). Remediation: disable auto-register, register via Terraform, set `use.latest.version=true`. |
+| **C-Connector: Auto-register (connector-native)** | Kafka Connect source connector uses `auto.register.schemas=true` in converter config — CDC, JDBC Source, S3 Source, SaaS source, MirrorMaker2, etc. | Expected behavior — do NOT disable. Apply connector governance: set compatibility mode via `confluent_subject_config`, configure subject naming strategy, apply PII tags via `confluent_tag_binding` or SMT, import into Terraform state, enable schema change monitoring. |
 | **D: No schema** | Raw strings/bytes where field names and types cannot be reliably determined (e.g., raw CSV without headers, binary protocols, obfuscated data). If inline JSON keys are visible and a schema can be inferred per Section 3.2b, classify as Category B instead | Flag in report with recommendation to adopt schema-first approach |
 | **E: Custom serializer** | Implements `Serializer<T>` interface, uses `json.dumps`/`JSON.stringify`/`JsonConvert`/`json.Marshal`/`GenericDatumWriter`/`fastavro`/`proto.Marshal` inline, or has a custom serialization function — all without SR | Extract schema from the data model inside the custom serializer → `terraform/schemas.tf` + recommend replacing with Confluent serializer + `HeaderSchemaIdSerializer`. Consumers must be upgraded first using a composite deserializer pattern (Java). See upgrade rules below. |
 
@@ -1523,26 +1571,269 @@ Replace the custom serializer with a Confluent serializer. The payload format ch
 
 **Step 1 — Upgrade all consumers (before touching producers):**
 
-*Java:*
-Configure a composite deserializer that wraps both the old custom deserializer and the new Confluent deserializer. The composite deserializer inspects each message for a schema ID (in the header or payload prefix). If a schema ID is found, it delegates to the Confluent deserializer. If not, it falls back to the old custom deserializer. This lets consumers read both old-format and new-format data during the migration. See the [Confluent migration guidelines](https://docs.confluent.io) for the exact configuration properties.
+The challenge: during migration, the topic contains a mix of old-format messages (produced by the custom serializer — raw JSON with no schema ID) and new-format messages (produced by the Confluent serializer — schema ID in headers). Consumers must handle both until all old data has been consumed or expired.
 
-*Python / .NET / Go / Node.js:*
-These languages do not have a composite deserializer. Deploy a new consumer version that can handle both formats, or do a coordinated cutover.
+**IMPORTANT:** `CompositeDeserializer` is a Java-only concept. Each language has its own pattern for dual-format handling. Do not recommend `CompositeDeserializer` for Python, .NET, Go, or Node.js consumers.
+
+---
+
+**Java — Hybrid deserializer using header inspection:**
+
+In Java, implement a `Deserializer<T>` that checks for the `__value_schema_id` header written by `HeaderSchemaIdSerializer`. If found, delegate to `KafkaJsonSchemaDeserializer` (or Avro/Protobuf equivalent). If not, fall back to the legacy custom deserializer.
+
+```java
+public class HybridJsonDeserializer<T> implements Deserializer<T> {
+    private final KafkaJsonSchemaDeserializer<T> srDeserializer = new KafkaJsonSchemaDeserializer<>();
+    private final ObjectMapper legacyMapper = new ObjectMapper();
+    private final Class<T> targetType;
+
+    public HybridJsonDeserializer(Class<T> targetType) {
+        this.targetType = targetType;
+    }
+
+    @Override
+    public void configure(Map<String, ?> configs, boolean isKey) {
+        srDeserializer.configure(configs, isKey);
+    }
+
+    @Override
+    public T deserialize(String topic, Headers headers, byte[] data) {
+        if (data == null) return null;
+        // HeaderSchemaIdSerializer writes schema ID to __value_schema_id header
+        if (headers != null && headers.lastHeader("__value_schema_id") != null) {
+            return srDeserializer.deserialize(topic, headers, data);
+        }
+        // No schema ID header → legacy custom format
+        try {
+            return legacyMapper.readValue(data, targetType);
+        } catch (Exception e) {
+            throw new SerializationException("Failed to deserialize legacy format", e);
+        }
+    }
+
+    @Override
+    public T deserialize(String topic, byte[] data) {
+        // Called without headers — cannot distinguish formats; assume legacy
+        try {
+            return legacyMapper.readValue(data, targetType);
+        } catch (Exception e) {
+            throw new SerializationException("Failed to deserialize without headers context", e);
+        }
+    }
+}
+```
+
+Configure in Spring Boot:
+```properties
+spring.kafka.consumer.value-deserializer=com.example.kafka.HybridJsonDeserializer
+schema.registry.url=https://your-sr-endpoint
+```
+
+For Avro custom serializer migrations, replace `KafkaJsonSchemaDeserializer` with `KafkaAvroDeserializer` and the fallback with `GenericDatumReader` / `SpecificDatumReader`.
+
+---
+
+**Python — Hybrid deserializer with try/except fallback:**
+
+Python has no composite deserializer. Implement a callable deserializer that attempts SR deserialization first (by checking for the schema ID header) and falls back to the legacy format.
+
+```python
+import json
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.json_schema import JSONDeserializer
+from confluent_kafka.serialization import SerializationContext, MessageField
+
+sr_client = SchemaRegistryClient({'url': 'https://your-sr-endpoint'})
+json_deserializer = JSONDeserializer(schema_str, schema_registry_client=sr_client)
+
+def hybrid_deserializer(data, ctx):
+    """Handles both legacy raw JSON (no schema ID) and SR JSON (schema ID in headers)."""
+    if data is None:
+        return None
+    # confluent_kafka exposes headers via ctx if available
+    # HeaderSchemaIdSerializer writes '__value_schema_id' to message headers
+    headers = getattr(ctx, 'headers', None) or {}
+    has_schema_header = any(k == '__value_schema_id' for k, _ in (headers or []))
+    if has_schema_header:
+        return json_deserializer(data, ctx)
+    # Legacy path — raw JSON, no schema ID
+    return json.loads(data.decode('utf-8'))
+
+# DeserializingConsumer config:
+consumer_conf = {
+    'bootstrap.servers': 'broker:9092',
+    'group.id': 'my-consumer-group',
+    'value.deserializer': hybrid_deserializer,
+}
+```
+
+Note: if the consumer processes messages from a batch where headers are unavailable, add a magic-byte check: `data[0] == 0x00` indicates a payload-prefix schema ID (non-header mode); absence of the 0x00 magic byte indicates legacy raw format.
+
+---
+
+**.NET — Custom `IDeserializer<T>` with header inspection:**
+
+.NET has no `CompositeDeserializer`. Implement `IDeserializer<T>` manually. The `SerializationContext` passed to `Deserialize()` carries the message headers.
+
+```csharp
+using Confluent.Kafka;
+using Confluent.SchemaRegistry;
+using Confluent.SchemaRegistry.Serdes;
+using System.Text;
+using System.Text.Json;
+
+public class HybridJsonDeserializer<T> : IDeserializer<T>
+{
+    private readonly JsonDeserializer<T> _srDeserializer;
+
+    public HybridJsonDeserializer(ISchemaRegistryClient srClient)
+    {
+        _srDeserializer = new JsonDeserializer<T>(srClient, new JsonDeserializerConfig
+        {
+            // Header mode: schema ID is read from __value_schema_id header
+            SchemaIdLocation = SchemaIdLocation.Header,
+        });
+    }
+
+    public T Deserialize(ReadOnlySpan<byte> data, bool isNull, SerializationContext context)
+    {
+        if (isNull) return default!;
+
+        // Check for schema ID header written by HeaderSchemaIdSerializer
+        bool hasSchemaHeader = context.Headers?
+            .TryGetLastBytes("__value_schema_id", out _) == true;
+
+        if (hasSchemaHeader)
+        {
+            return _srDeserializer.Deserialize(data, isNull, context);
+        }
+
+        // Legacy path — plain JSON, no schema ID
+        return JsonSerializer.Deserialize<T>(data,
+            new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+    }
+}
+
+// Wire up in consumer builder:
+var consumer = new ConsumerBuilder<string, MyType>(consumerConfig)
+    .SetValueDeserializer(new HybridJsonDeserializer<MyType>(schemaRegistryClient))
+    .Build();
+```
+
+For Avro: replace `JsonDeserializer<T>` with `AvroDeserializer<T>` and the legacy fallback with your existing custom deserialization logic.
+
+---
+
+**Go — Hybrid deserializer with header inspection:**
+
+Go has no composite deserializer. Check message headers before choosing the deserialization path. The `confluent-kafka-go` `Message.Headers` slice holds all headers.
+
+```go
+import (
+    "encoding/json"
+    "github.com/confluentinc/confluent-kafka-go/v2/kafka"
+    "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry"
+    "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde"
+    "github.com/confluentinc/confluent-kafka-go/v2/schemaregistry/serde/jsonschema"
+)
+
+func hasSchemaIDHeader(msg *kafka.Message) bool {
+    for _, h := range msg.Headers {
+        if h.Key == "__value_schema_id" {
+            return true
+        }
+    }
+    return false
+}
+
+func hybridDeserialize[T any](
+    msg *kafka.Message,
+    srDeserializer *jsonschema.Deserializer,
+) (*T, error) {
+    if hasSchemaIDHeader(msg) {
+        // New format: schema ID in header, delegate to SR deserializer
+        result, err := srDeserializer.Deserialize(*msg.TopicPartition.Topic, msg.Value)
+        if err != nil {
+            return nil, err
+        }
+        typed, ok := result.(*T)
+        if !ok {
+            return nil, fmt.Errorf("unexpected type from SR deserializer")
+        }
+        return typed, nil
+    }
+    // Legacy format: raw JSON, no schema ID
+    var result T
+    if err := json.Unmarshal(msg.Value, &result); err != nil {
+        return nil, fmt.Errorf("legacy deserialization failed: %w", err)
+    }
+    return &result, nil
+}
+
+// Setup:
+srClient, _ := schemaregistry.NewClient(schemaregistry.NewConfig("https://your-sr-endpoint"))
+deserializer, _ := jsonschema.NewDeserializer(srClient, serde.ValueSerde, jsonschema.NewDeserializerConfig())
+
+// In consume loop:
+msg, _ := consumer.ReadMessage(-1)
+result, err := hybridDeserialize[MyType](msg, deserializer)
+```
+
+For Avro: replace `jsonschema.NewDeserializer` with `avrov2.NewDeserializer` from `confluent-kafka-go/v2/schemaregistry/serde/avrov2`.
+
+---
+
+**Node.js / TypeScript — Hybrid handler with header inspection:**
+
+`@confluentinc/kafka-javascript` has no composite deserializer. Inspect the `headers` on each message before choosing the deserialization path.
+
+```typescript
+import { KafkaJS } from '@confluentinc/kafka-javascript';
+import { SchemaRegistryClient, SerdeType } from '@confluentinc/kafka-javascript';
+
+const srClient = new SchemaRegistryClient({ baseUrls: ['https://your-sr-endpoint'] });
+
+async function hybridDeserialize<T>(message: KafkaJS.EachMessagePayload['message']): Promise<T> {
+    const headers = message.headers ?? {};
+    const hasSchemaHeader = '__value_schema_id' in headers;
+
+    if (hasSchemaHeader) {
+        // New format: schema ID in header — use SR deserializer
+        const deserializer = srClient.deserializer(SerdeType.VALUE);
+        return deserializer.deserialize(message.value!.toString('base64')) as T;
+    }
+
+    // Legacy format: plain JSON string, no schema ID
+    return JSON.parse(message.value!.toString('utf8')) as T;
+}
+
+// In consumer:
+await consumer.run({
+    eachMessage: async ({ topic, partition, message }) => {
+        const event = await hybridDeserialize<MyEventType>(message);
+        // process event
+    },
+});
+```
+
+---
 
 **Step 2 — Upgrade all producers:**
 
-Replace the custom serializer with the Confluent serializer for the chosen format:
+Once all consumer instances are deployed with the hybrid deserializer, replace the custom serializer with the Confluent serializer. All new messages will have the schema ID in headers. Old messages (pre-migration) are handled by the legacy fallback in the hybrid deserializer until they expire.
 
-| Language | Recommended Serializer | Config |
-|----------|----------------------|--------|
-| Java | `KafkaAvroSerializer` / `ProtobufSerializer` / `KafkaJsonSchemaSerializer` | Set `value.serializer`, `schema.registry.url`, `value.schema.id.serializer=HeaderSchemaIdSerializer` |
-| Python | `confluent-kafka` `AvroSerializer` / `ProtobufSerializer` / `JSONSerializer` | Use `SerializingProducer`, set `value.schema.id.serializer` |
-| .NET | `Confluent.SchemaRegistry.Serdes` serializer + header mode | Add NuGet, configure header-based schema ID |
-| Go | `confluent-kafka-go` serializer + header mode | Add SR client, configure header-based schema ID |
-| Node | `@confluentinc/kafka-javascript` with SR + header mode | Replace library, configure header-based schema ID |
+| Language | Replace With | Required Config |
+|----------|-------------|-----------------|
+| Java | `KafkaJsonSchemaSerializer` + `HeaderSchemaIdSerializer` | `value.serializer`, `schema.registry.url`, `value.schema.id.serializer=io.confluent.kafka.serializers.schema.id.HeaderSchemaIdSerializer` |
+| Python | `confluent-kafka` `JSONSerializer` + `HeaderSchemaIdSerializer` | `value.schema.id.serializer=HeaderSchemaIdSerializer()` on `SerializingProducer` |
+| .NET | `Confluent.SchemaRegistry.Serdes.JsonSerializer<T>` | `SchemaRegistryConfig { SchemaIdLocation = SchemaIdLocation.Header }` |
+| Go | `confluent-kafka-go/v2/schemaregistry/serde/jsonschema.NewSerializer` | `SerializerConfig { EnableHeaders: true }` |
+| Node | `@confluentinc/kafka-javascript` with SR + header mode | `SerdeType.VALUE` with `SchemaIdLocation.Header` |
 | PHP | `php-rdkafka` with SR integration + header mode | Add SR client, configure header-based schema ID |
 
-Once all producers are upgraded, consumers read new data via the Confluent deserializer and old data via the custom deserializer (Java composite deserializer). After all old data has been consumed or expired, the composite deserializer can be replaced with the standard Confluent deserializer.
+**Step 3 — Retire the hybrid deserializer:**
+
+After the topic's retention period has elapsed (all old-format messages have expired), replace the hybrid deserializer with the standard Confluent deserializer on all consumers. Remove the legacy fallback code path entirely.
 
 ---
 
@@ -1635,14 +1926,30 @@ Topics where serializer changes may affect consumers:
 
 | Topic | Category | Producers Changing | Active Consumers | Rollout Order | Consumer Action |
 |-------|----------|-------------------|-----------------|---------------|-----------------|
-| {topic} | B | {app} | {consumers} | Producers first | None during migration. Eventually upgrade to Confluent deserializer. |
-| {topic} | A→Header | {app} | {consumers} | Producers only | None — Confluent deserializers on supported versions automatically read schema ID from both headers and payload. Verify client version. |
-| {topic} | E | {app} | {consumers} | Consumers first | Java: configure composite deserializer to handle both old and new formats. Other langs: coordinated cutover. |
+| {topic} | B | {app} | {consumers} | Producers first | None during migration — consumers are parsing raw JSON today and will continue to work. After migration completes, upgrade consumers to Confluent deserializer to gain schema validation. |
+| {topic} | A→Header | {app} | {consumers} | Producers only | Verify consumer client versions (Java CP 8.0+, Python 2.10.1+, .NET 2.10.1+, Go 2.10.1+, Node 1.3.2+). On supported versions, Confluent deserializers automatically check headers first and fall back to payload prefix. No config change needed. |
+| {topic} | C-App | {app} | {consumers} | Producers first (after disabling auto-register) | No consumer changes. Disabling auto-register and registering via Terraform does not change the serialized format. |
+| {topic} | C-Connector | {connector} | {consumers} | Connector governance only — no migration | Consumers using Confluent SR deserializers continue working. If consumers use `StringDeserializer`, upgrade them to `KafkaAvroDeserializer` (or JSON/Protobuf equivalent) using the language-specific guidance below. |
+| {topic} | E | {app} | {consumers} | **Consumers first** | Deploy hybrid deserializer before touching producers. Language-specific patterns: see below. |
 
-> **Automatic dual-read behavior:** All Confluent client libraries on supported versions
-> automatically check Kafka headers first for the schema ID, then fall back to the
-> payload prefix. No consumer configuration change is needed when producers switch to
-> `HeaderSchemaIdSerializer`.
+> **Category E — Consumer upgrade is required before producers change.**
+> The serialized format changes when replacing a custom serializer with a Confluent serializer.
+> Consumers must be able to handle both the old format (no schema ID) and the new format (schema ID in headers)
+> during the transition window. See the "Upgrade Quick Reference — Custom Serializers (Category E)" section
+> for per-language hybrid deserializer patterns.
+
+**Per-language consumer upgrade summary for Category E:**
+
+| Language | Dual-format strategy | Standard deserializer (post-migration) |
+|----------|---------------------|----------------------------------------|
+| Java | Implement `Deserializer<T>` that checks `__value_schema_id` header; delegate to `KafkaJsonSchemaDeserializer` if present, else fall back to legacy deserializer | `KafkaJsonSchemaDeserializer` / `KafkaAvroDeserializer` / `KafkaProtobufDeserializer` |
+| Python | Callable deserializer with header inspection; try `JSONDeserializer` if header present, else `json.loads()` fallback | `confluent_kafka.schema_registry.json_schema.JSONDeserializer` |
+| .NET | Custom `IDeserializer<T>` that inspects `context.Headers` for `__value_schema_id`; delegates to `JsonDeserializer<T>` (header mode) or `JsonSerializer.Deserialize<T>` fallback | `Confluent.SchemaRegistry.Serdes.JsonDeserializer<T>` with `SchemaIdLocation.Header` |
+| Go | Helper function that checks `msg.Headers` for `__value_schema_id`; delegates to `jsonschema.Deserializer` or `json.Unmarshal` fallback | `confluent-kafka-go/v2/schemaregistry/serde/jsonschema.NewDeserializer` |
+| Node.js | Message handler that checks `message.headers` for `__value_schema_id`; delegates to SR deserializer or `JSON.parse()` fallback | `@confluentinc/kafka-javascript` `SchemaRegistryClient.deserializer()` |
+
+> **`CompositeDeserializer` is Java-only.** Do not recommend it for Python, .NET, Go, or Node.js consumers.
+> Each language requires its own dual-format implementation as shown in the upgrade reference section.
 
 ---
 

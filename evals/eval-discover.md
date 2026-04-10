@@ -43,6 +43,7 @@ Generate recommendations, schema stubs, and code patches.
 - `discover/kafka_schemas.yaml` exists with envelope fields (event_id, event_type, event_timestamp, event_version, source_service)
 - `discover/patches/order-api-kafka-producer.patch` exists
 - Schema format detected from repo (not hardcoded to JSON)
+- Schema stubs contain NO `confluent:tags`, NO `confluent.field_meta`
 
 ### Phase D5: Report
 
@@ -55,6 +56,7 @@ Generate recommendations, schema stubs, and code patches.
 - [ ] `updateOrderStatus()` ranks highest or tied for highest
 - [ ] All candidates have `status: pending_review` (nothing auto-approved)
 - [ ] Schema stubs include all 5 envelope fields
+- [ ] Schema stubs contain NO `confluent:tags` or `confluent.field_meta` (purity requirement)
 - [ ] PII fields detected and tagged on CustomerDTO
 - [ ] Patch file uses Confluent serializer + SR (NOT raw `objectMapper.writeValueAsString`)
 - [ ] Patch file uses `HeaderSchemaIdSerializer` config
