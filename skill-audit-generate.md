@@ -931,6 +931,17 @@ Wrap all checks (local validation + live SR compatibility) into the single `scri
 
 Create a comprehensive markdown report at the repo root. Use the template below, filling in data from the app catalog.
 
+**CRITICAL — C-Connector report rules (Kafka Connect source connectors):**
+- **NEVER** recommend setting `auto.register.schemas=false` for C-Connector entries (Debezium, JDBC Source, S3 Source, MongoDB Source, MirrorMaker2, SaaS source connectors). Disabling auto-register breaks these connectors.
+- **NEVER** include C-Connector entries in the auto-register RISKS section alongside C-App entries. They are fundamentally different risks.
+- **INSTEAD**, for C-Connector entries, create a separate "Connector Governance" section recommending:
+  1. Set explicit compatibility mode per subject via `confluent_subject_config`
+  2. Configure subject naming strategy (`TopicRecordNameStrategy` recommended for CDC)
+  3. Apply PII tags post-registration via contract files and `confluent_tag_binding`
+  4. Enable schema change monitoring (alert when connector registers a new version)
+  5. Import connector-generated schemas into Terraform state for tracking
+- If the report has both C-App and C-Connector findings, they MUST appear in separate sections with different remediation guidance.
+
 ```markdown
 # Kafka Schema Analysis Report
 
